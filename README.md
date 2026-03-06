@@ -7,6 +7,7 @@ The codec engine runs in-process, while a built-in web UI provides camera select
 
 - Webcam capture with runtime camera selection
 - Browser dashboard (no OpenCV text overlays on frames)
+- Role-based dashboard tabs: `Link`, `Send`, `Receive`, `Status`, `Advanced`
 - Triple live feed dashboard:
   - `RAW INPUT`
   - `SENT (DITHERED)`
@@ -32,7 +33,7 @@ The codec engine runs in-process, while a built-in web UI provides camera select
 - Custom bitstream with custom bit writer/reader
 - Live metrics: bytes/frame, live/smoothed/average bitrate, compression ratios, encoded fps, keyframe ratio, changed blocks, PSNR
 - Live bandwidth bar visualization
-- Web controls for mode, fps, resolution, camera, keyframe policy, enhancement, dithering, recording, force-keyframe, link mode, RX source, audio devices, session mode, band mode, media path, and link start/stop
+- Web controls are fully wired (no inert fields): transport, link role, serial settings, relay paths, text send, codec/display toggles, and link start/stop
 
 ## Build
 
@@ -124,6 +125,8 @@ Unit-test coverage includes:
 - malformed change-map rejection
 - keyframe interval behavior and frame-index progression
 - deterministic encoding checks (same input/state -> same bytes)
+- communicator envelope fragmentation/reassembly checks
+- communicator envelope corruption rejection and queue dedup checks
 
 ## CI Artifacts
 
@@ -141,25 +144,22 @@ What it does on each push/PR/manual run:
 
 ## Controls
 
-- Use browser controls in the right-side panel:
-  - camera selector
-  - mode selector (`safer` / `aggressive`)
-  - resolution selector
-  - target fps numeric field (no upper cap in the engine)
-  - keyframe interval toggle (`default` / `short`)
-  - enhancement toggle
-  - dithering toggle
-  - recording toggle
-  - force keyframe button
-  - link mode selector
-  - RX source selector (live mic / media file)
-  - session mode selector (broadcast / duplex_arq)
-  - band selector (audible / ultrasonic)
-  - audio input/output selectors
-  - media path input for file-based receive
-  - start/stop link buttons
-  - rescan cameras button
+- `Link` tab: essential setup for non-technical use (alias, camera, transport, role, quality, resolution, fps, start/stop).
+- `Send` tab: reliable text channel + quick emergency phrases + timeline.
+- `Receive` tab: relay import/export actions.
+- `Status` tab: queue/link/codec diagnostics.
+- `Advanced` tab: acoustic/serial specifics and codec/display toggles.
+- Transport role selector uses `send` / `receive` / `duplex`.
 - Start camera preference can be set with `EV_CAMERA_INDEX` (default `1`)
+
+HTTP API (v2 only):
+
+- `GET /api/v2/state`
+- `POST /api/v2/control`
+- `POST /api/v2/link/start`
+- `POST /api/v2/link/stop`
+- `POST /api/v2/messages/send`
+- `GET /api/v2/frame/{raw|sent|received}.jpg`
 
 Face detector note:
 

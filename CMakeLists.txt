@@ -82,6 +82,11 @@ add_executable(emergency_video
     decoder.cpp
     metrics.cpp
     util.cpp
+    communicator_protocol.cpp
+    queue_manager.cpp
+    router.cpp
+    persistent_store.cpp
+    transport_manager.cpp
     acoustic_link.cpp
     acoustic_modem.cpp
     audio_io.cpp
@@ -239,6 +244,10 @@ if(EV_BUILD_TESTS)
         codec.cpp
         encoder.cpp
         decoder.cpp
+        communicator_protocol.cpp
+        queue_manager.cpp
+        router.cpp
+        persistent_store.cpp
     )
     target_include_directories(emergency_video_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     if(MSVC)

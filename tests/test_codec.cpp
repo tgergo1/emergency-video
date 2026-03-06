@@ -8,9 +8,11 @@
 
 #include "bitstream.h"
 #include "codec.h"
+#include "communicator_protocol.h"
 #include "decoder.h"
 #include "encoder.h"
 #include "frame.h"
+#include "queue_manager.h"
 
 namespace {
 void require(bool condition, const std::string &message) {
@@ -305,6 +307,86 @@ void testInterframeWithoutReferenceRejected() {
     require(result.error.find("without reference") != std::string::npos,
             "Unexpected error for missing reference: " + result.error);
 }
+
+void testCommEnvelopeFragmentRoundTrip() {
+    CommEnvelopeHeader base;
+    base.protoVersion = 1;
+    base.payloadType = CommPayloadType::VideoFrame;
+    base.msgId = 42;
+    base.streamId = 7;
+    base.senderNodeId = 123;
+    base.targetScope = TargetScope::Broadcast;
+    base.targetNodeId = 0;
+    base.seq = 9;
+    base.timestampMs = nowUnixMs();
+    base.ttlMs = 5000;
+
+    std::vector<uint8_t> payload(333);
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<uint8_t>((i * 19U) & 0xFFU);
+    }
+
+    const std::vector<std::vector<uint8_t>> frags = fragmentCommPayload(payload, 40);
+    require(frags.size() > 1, "Expected fragmented payload");
+
+    std::vector<std::vector<uint8_t>> wire;
+    for (std::size_t i = 0; i < frags.size(); ++i) {
+        CommEnvelopeHeader h = base;
+        h.fragIndex = static_cast<uint16_t>(i);
+        h.fragCount = static_cast<uint16_t>(frags.size());
+        wire.push_back(serializeCommEnvelope(h, frags[i]));
+    }
+    std::reverse(wire.begin(), wire.end());
+
+    std::vector<std::vector<uint8_t>> parts(frags.size());
+    std::vector<uint8_t> seen(frags.size(), 0);
+    for (const auto &frame : wire) {
+        CommEnvelopeHeader h;
+        std::vector<uint8_t> p;
+        std::string error;
+        require(deserializeCommEnvelope(frame, h, p, error), "Fragment decode failed: " + error);
+        require(h.fragIndex < h.fragCount, "Fragment index out of range");
+        parts[h.fragIndex] = std::move(p);
+        seen[h.fragIndex] = 1;
+    }
+
+    require(std::all_of(seen.begin(), seen.end(), [](uint8_t v) { return v != 0; }), "Missing fragments");
+
+    std::vector<uint8_t> rebuilt;
+    for (const auto &part : parts) {
+        rebuilt.insert(rebuilt.end(), part.begin(), part.end());
+    }
+    require(rebuilt == payload, "Reassembled payload mismatch");
+}
+
+void testCommEnvelopeCorruptionRejected() {
+    CommEnvelopeHeader header;
+    header.payloadType = CommPayloadType::Text;
+    header.msgId = 11;
+    header.senderNodeId = 22;
+    header.seq = 33;
+    header.timestampMs = nowUnixMs();
+    header.ttlMs = 10000;
+
+    const std::vector<uint8_t> payload = serializeTextPayload(0, "hello");
+    std::vector<uint8_t> frame = serializeCommEnvelope(header, payload);
+    require(!frame.empty(), "Envelope unexpectedly empty");
+
+    frame[frame.size() / 2] ^= 0x5AU;
+    CommEnvelopeHeader decodedHeader;
+    std::vector<uint8_t> decodedPayload;
+    std::string error;
+    require(!deserializeCommEnvelope(frame, decodedHeader, decodedPayload, error),
+            "Corrupted envelope should be rejected");
+}
+
+void testQueueManagerDedupBySenderMsg() {
+    QueueManager queue;
+    require(!queue.isDuplicate(100, 1), "First sender/msg should not be duplicate");
+    require(queue.isDuplicate(100, 1), "Second sender/msg should be duplicate");
+    require(!queue.isDuplicate(101, 1), "Different sender should not be duplicate");
+    require(!queue.isDuplicate(100, 2), "Different msg should not be duplicate");
+}
 } // namespace
 
 int main() {
@@ -323,6 +405,9 @@ int main() {
         {"frame_index_and_decode_sequence", testFrameIndexAndDecodeSequence},
         {"deterministic_encoding", testDeterministicEncoding},
         {"interframe_without_reference_rejected", testInterframeWithoutReferenceRejected},
+        {"comm_fragment_round_trip", testCommEnvelopeFragmentRoundTrip},
+        {"comm_corruption_rejected", testCommEnvelopeCorruptionRejected},
+        {"queue_dedup_sender_msg", testQueueManagerDedupBySenderMsg},
     };
 
     int failed = 0;

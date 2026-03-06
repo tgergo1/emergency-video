@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -14,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -37,6 +39,10 @@
 #include "acoustic_modem.h"
 #include "audio_io.h"
 #include "media_ffmpeg.h"
+#include "communicator_protocol.h"
+#include "persistent_store.h"
+#include "router.h"
+#include "transport_manager.h"
 
 namespace {
 constexpr const char *kBindHost = "0.0.0.0";
@@ -51,6 +57,37 @@ const std::vector<cv::Size> kResolutionLevels = {
 };
 
 constexpr double kMinTargetFps = 0.2;
+
+enum class LinkRole : uint8_t {
+    Send = 0,
+    Receive = 1,
+    Duplex = 2,
+};
+
+const char *linkRoleName(LinkRole role) {
+    switch (role) {
+    case LinkRole::Send:
+        return "send";
+    case LinkRole::Receive:
+        return "receive";
+    case LinkRole::Duplex:
+        return "duplex";
+    }
+    return "duplex";
+}
+
+LinkRole parseLinkRole(const std::string &text, LinkRole fallback = LinkRole::Duplex) {
+    if (text == "send") {
+        return LinkRole::Send;
+    }
+    if (text == "receive") {
+        return LinkRole::Receive;
+    }
+    if (text == "duplex") {
+        return LinkRole::Duplex;
+    }
+    return fallback;
+}
 
 struct MotionVector {
     int dx = 0;
@@ -77,7 +114,7 @@ struct ControlState {
     bool useReceivedDithering = false;
     bool recordingEnabled = false;
     int requestedCameraIndex = 0;
-    LinkMode linkMode = LinkMode::LocalLoopback;
+    LinkRole linkRole = LinkRole::Duplex;
     RxSource rxSource = RxSource::LiveMic;
     SessionMode sessionMode = SessionMode::Broadcast;
     BandMode bandMode = BandMode::Audible;
@@ -85,12 +122,24 @@ struct ControlState {
     int requestedAudioOutputDevice = -1;
     bool linkRunning = false;
     std::string mediaPath;
+    TransportKind transportKind = TransportKind::Acoustic;
+    std::string serialPort;
+    int serialBaud = 115200;
+    std::string nodeAlias = "Field-Unit";
+    std::string relayExportPath = "./relay_out/export.evrelay";
+    std::string relayImportPath;
+    std::string outgoingText;
+    TargetScope outgoingTextScope = TargetScope::Broadcast;
+    uint64_t outgoingTextTarget = 0;
 
     bool forceNextKeyframe = false;
     bool rescanCameras = false;
     bool rescanAudio = false;
     bool startLink = false;
     bool stopLink = false;
+    bool sendText = false;
+    bool exportRelay = false;
+    bool importRelay = false;
 };
 
 struct SharedState {
@@ -124,7 +173,7 @@ struct SharedState {
 
     std::string status = "initializing";
 
-    LinkMode linkMode = LinkMode::LocalLoopback;
+    LinkRole linkRole = LinkRole::Duplex;
     RxSource rxSource = RxSource::LiveMic;
     SessionMode sessionMode = SessionMode::Broadcast;
     BandMode bandMode = BandMode::Audible;
@@ -139,6 +188,17 @@ struct SharedState {
     uint32_t streamId = 0;
     uint16_t configVersion = 0;
     uint32_t configHash = 0;
+    TransportKind transportKind = TransportKind::Acoustic;
+    std::string transportStatus = "idle";
+    std::string serialPort;
+    int serialBaud = 115200;
+    std::string relayExportPath = "./relay_out/export.evrelay";
+    std::string relayImportPath;
+    std::string nodeAlias = "Field-Unit";
+    FallbackStage fallbackStage = FallbackStage::Normal;
+    QueueStats queueStats{};
+    std::vector<TextMessage> messages;
+    uint64_t latestTextCursor = 0;
 };
 
 std::atomic<bool> gStop{false};
@@ -634,6 +694,156 @@ std::map<std::string, std::string> queryMapFromTarget(const std::string &target)
     return out;
 }
 
+std::string trimWhitespace(std::string value) {
+    auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](char c) { return !isSpace(c); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [&](char c) { return !isSpace(c); }).base(), value.end());
+    return value;
+}
+
+bool parseFlatJsonObject(const std::string &json, std::map<std::string, std::string> &out) {
+    out.clear();
+    std::size_t i = 0;
+    auto skipWs = [&]() {
+        while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i])) != 0) {
+            ++i;
+        }
+    };
+
+    auto parseString = [&](std::string &value) -> bool {
+        value.clear();
+        if (i >= json.size() || json[i] != '"') {
+            return false;
+        }
+        ++i;
+        while (i < json.size()) {
+            const char ch = json[i++];
+            if (ch == '"') {
+                return true;
+            }
+            if (ch != '\\') {
+                value.push_back(ch);
+                continue;
+            }
+            if (i >= json.size()) {
+                return false;
+            }
+            const char esc = json[i++];
+            switch (esc) {
+            case '"':
+            case '\\':
+            case '/':
+                value.push_back(esc);
+                break;
+            case 'b':
+                value.push_back('\b');
+                break;
+            case 'f':
+                value.push_back('\f');
+                break;
+            case 'n':
+                value.push_back('\n');
+                break;
+            case 'r':
+                value.push_back('\r');
+                break;
+            case 't':
+                value.push_back('\t');
+                break;
+            case 'u':
+                // Keep parser lightweight: skip unicode code unit and preserve placeholder.
+                if (i + 4 > json.size()) {
+                    return false;
+                }
+                i += 4;
+                value.push_back('?');
+                break;
+            default:
+                return false;
+            }
+        }
+        return false;
+    };
+
+    skipWs();
+    if (i >= json.size() || json[i] != '{') {
+        return false;
+    }
+    ++i;
+
+    while (true) {
+        skipWs();
+        if (i < json.size() && json[i] == '}') {
+            ++i;
+            break;
+        }
+
+        std::string key;
+        if (!parseString(key)) {
+            return false;
+        }
+        skipWs();
+        if (i >= json.size() || json[i] != ':') {
+            return false;
+        }
+        ++i;
+        skipWs();
+
+        std::string value;
+        if (i < json.size() && json[i] == '"') {
+            if (!parseString(value)) {
+                return false;
+            }
+        } else {
+            const std::size_t start = i;
+            while (i < json.size() && json[i] != ',' && json[i] != '}') {
+                ++i;
+            }
+            value = trimWhitespace(json.substr(start, i - start));
+        }
+        out[key] = value;
+
+        skipWs();
+        if (i < json.size() && json[i] == ',') {
+            ++i;
+            continue;
+        }
+        if (i < json.size() && json[i] == '}') {
+            ++i;
+            break;
+        }
+        return false;
+    }
+
+    skipWs();
+    return i == json.size();
+}
+
+std::map<std::string, std::string> requestParamMap(const httplib::Request &req) {
+    std::map<std::string, std::string> out;
+    const std::map<std::string, std::string> queryMap = queryMapFromTarget(req.target);
+    out.insert(queryMap.begin(), queryMap.end());
+
+    for (const auto &entry : req.params) {
+        out[entry.first] = entry.second;
+    }
+
+    const auto ctypeIt = req.headers.find("Content-Type");
+    const bool jsonBody = (ctypeIt != req.headers.end() &&
+                           ctypeIt->second.find("application/json") != std::string::npos);
+    if (jsonBody && !req.body.empty()) {
+        std::map<std::string, std::string> parsed;
+        if (parseFlatJsonObject(req.body, parsed)) {
+            out.insert(parsed.begin(), parsed.end());
+            for (const auto &entry : parsed) {
+                out[entry.first] = entry.second;
+            }
+        }
+    }
+
+    return out;
+}
+
 std::string jsonEscape(const std::string &value) {
     std::ostringstream out;
     for (unsigned char c : value) {
@@ -695,6 +905,27 @@ std::string audioDevicesJsonArray(const std::vector<AudioDeviceInfo> &devices) {
     return oss.str();
 }
 
+std::string textMessagesJsonArray(const std::vector<TextMessage> &messages) {
+    std::ostringstream oss;
+    oss << "[";
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << "{";
+        oss << "\"msg_id\":" << messages[i].msgId << ",";
+        oss << "\"sender\":" << messages[i].senderNodeId << ",";
+        oss << "\"target\":" << messages[i].targetNodeId << ",";
+        oss << "\"scope\":\"" << (messages[i].targetScope == TargetScope::Broadcast ? "broadcast" : "direct") << "\",";
+        oss << "\"timestamp_ms\":" << messages[i].timestampMs << ",";
+        oss << "\"state\":" << static_cast<int>(messages[i].state) << ",";
+        oss << "\"body\":\"" << jsonEscape(messages[i].body) << "\"";
+        oss << "}";
+    }
+    oss << "]";
+    return oss.str();
+}
+
 std::string buildStateJson(const SharedState &state) {
     std::ostringstream oss;
     oss << "{";
@@ -709,7 +940,10 @@ std::string buildStateJson(const SharedState &state) {
     oss << "\"recording\":" << (state.recordingEnabled ? "true" : "false") << ",";
     oss << "\"camera\":" << state.cameraIndex << ",";
     oss << "\"cameras\":" << camerasJsonArray(state.cameras) << ",";
-    oss << "\"link_mode\":\"" << linkModeName(state.linkMode) << "\",";
+    oss << "\"link_role\":\"" << linkRoleName(state.linkRole) << "\",";
+    oss << "\"transport_kind\":\"" << transportKindName(state.transportKind) << "\",";
+    oss << "\"transport_status\":\"" << jsonEscape(state.transportStatus) << "\",";
+    oss << "\"node_alias\":\"" << jsonEscape(state.nodeAlias) << "\",";
     oss << "\"rx_source\":\"" << rxSourceName(state.rxSource) << "\",";
     oss << "\"session_mode\":\"" << sessionModeName(state.sessionMode) << "\",";
     oss << "\"band_mode\":\"" << bandModeName(state.bandMode) << "\",";
@@ -720,9 +954,25 @@ std::string buildStateJson(const SharedState &state) {
     oss << "\"audio_inputs\":" << audioDevicesJsonArray(state.audioInputs) << ",";
     oss << "\"audio_outputs\":" << audioDevicesJsonArray(state.audioOutputs) << ",";
     oss << "\"media_path\":\"" << jsonEscape(state.mediaPath) << "\",";
+    oss << "\"serial_port\":\"" << jsonEscape(state.serialPort) << "\",";
+    oss << "\"serial_baud\":" << state.serialBaud << ",";
+    oss << "\"relay_export_path\":\"" << jsonEscape(state.relayExportPath) << "\",";
+    oss << "\"relay_import_path\":\"" << jsonEscape(state.relayImportPath) << "\",";
     oss << "\"stream_id\":" << state.streamId << ",";
     oss << "\"config_version\":" << state.configVersion << ",";
     oss << "\"config_hash\":" << state.configHash << ",";
+    oss << "\"fallback_stage\":" << static_cast<int>(state.fallbackStage) << ",";
+    oss << "\"queue\":{";
+    oss << "\"config\":" << state.queueStats.queuedConfig << ",";
+    oss << "\"ack\":" << state.queueStats.queuedAck << ",";
+    oss << "\"text\":" << state.queueStats.queuedText << ",";
+    oss << "\"snapshot\":" << state.queueStats.queuedSnapshot << ",";
+    oss << "\"video\":" << state.queueStats.queuedVideo << ",";
+    oss << "\"inflight\":" << state.queueStats.inFlightReliable << ",";
+    oss << "\"dropped\":" << state.queueStats.dropped;
+    oss << "},";
+    oss << "\"latest_text_cursor\":" << state.latestTextCursor << ",";
+    oss << "\"messages\":" << textMessagesJsonArray(state.messages) << ",";
     oss << "\"status\":\"" << jsonEscape(state.status) << "\",";
     oss << "\"have_stats\":" << (state.haveStats ? "true" : "false") << ",";
     oss << "\"packet_bytes\":" << state.latestPacketBytes << ",";
@@ -779,79 +1029,58 @@ std::string makeIndexHtml() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Emergency Video Platform</title>
+  <title>Emergency Communicator</title>
   <style>
     :root {
-      --bg: #0f1512;
-      --panel: #16201a;
-      --panel-2: #1c2a22;
-      --ink: #ecf6ef;
-      --muted: #a7bdb0;
-      --accent: #5af28c;
-      --line: #2c3f34;
+      --bg: #0f1513;
+      --panel: #192521;
+      --panel-soft: #1e2e29;
+      --line: #30433c;
+      --ink: #ecf5f1;
+      --muted: #a7bbb3;
+      --accent: #45d37d;
+      --accent-soft: #225b3d;
+      --danger: #d97575;
+      --warn: #ffd58a;
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; min-width: 0; }
     body {
       margin: 0;
-      font-family: "SF Pro Text", "Segoe UI", system-ui, sans-serif;
-      background: radial-gradient(1200px 600px at 70% -200px, #22362b 0%, var(--bg) 55%);
+      background: radial-gradient(circle at 90% -25%, #2d4139 0%, var(--bg) 58%);
       color: var(--ink);
+      font-family: "SF Pro Text", "Segoe UI", system-ui, sans-serif;
     }
     .shell {
-      max-width: 1680px;
+      width: min(1880px, 100vw);
       margin: 0 auto;
       padding: 14px;
       display: grid;
       gap: 12px;
     }
-    .top {
+    .topbar {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px 14px;
+      border-radius: 16px;
+      padding: 12px;
       display: grid;
       gap: 10px;
     }
-    .top h1 {
-      margin: 0;
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: .2px;
-    }
-    .row {
+    .bar-row {
       display: grid;
-      gap: 12px;
-      grid-template-columns: 1.2fr .9fr;
+      gap: 10px;
+      grid-template-columns: minmax(240px, 1.2fr) minmax(0, 2fr);
       align-items: center;
     }
-    .status {
-      color: var(--muted);
-      font-size: 13px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .meter {
-      display: grid;
-      gap: 6px;
-      justify-items: end;
-      font-size: 12px;
-      color: var(--muted);
-    }
-    progress {
-      width: min(560px, 100%);
-      height: 14px;
-      appearance: none;
-    }
-    progress::-webkit-progress-bar { background: #101712; border-radius: 999px; }
-    progress::-webkit-progress-value {
-      background: linear-gradient(90deg, #39d778, var(--accent));
-      border-radius: 999px;
-    }
-    .main {
+    .title h1 { margin: 0; font-size: 22px; line-height: 1.15; }
+    .status { margin-top: 5px; color: var(--muted); font-size: 13px; line-height: 1.3; }
+    .meter { display: grid; gap: 6px; }
+    progress { width: 100%; height: 13px; appearance: none; }
+    progress::-webkit-progress-bar { background: #0f1611; border-radius: 999px; }
+    progress::-webkit-progress-value { background: linear-gradient(90deg, #37ca6f, var(--accent)); border-radius: 999px; }
+    .layout {
       display: grid;
       gap: 12px;
-      grid-template-columns: minmax(0, 2.25fr) minmax(320px, 1fr);
+      grid-template-columns: minmax(0, 2.3fr) minmax(420px, 1fr);
       align-items: start;
     }
     .feeds {
@@ -865,547 +1094,535 @@ std::string makeIndexHtml() {
       border-radius: 14px;
       overflow: hidden;
     }
-    .card .label {
-      padding: 8px 10px;
-      background: var(--panel-2);
+    .label {
+      padding: 9px 10px;
+      background: var(--panel-soft);
       border-bottom: 1px solid var(--line);
       font-size: 12px;
       font-weight: 700;
-      text-transform: uppercase;
       letter-spacing: .08em;
-      color: #bce8ca;
+      text-transform: uppercase;
+      color: #bde8cd;
     }
     .feedimg {
       width: 100%;
-      display: block;
-      aspect-ratio: 4 / 3;
+      aspect-ratio: 4/3;
       object-fit: cover;
-      background: #0b100d;
+      background: #0a100c;
+      display: block;
     }
-    .controls {
+    .side {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 14px;
-      padding: 12px;
+      padding: 10px;
+      display: grid;
+      gap: 10px;
+      max-height: calc(100vh - 26px);
+      overflow: hidden;
+    }
+    .tabs {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+    .tabs button, .btn {
+      border-radius: 10px;
+      border: 1px solid #3a5146;
+      color: var(--ink);
+      background: #1a2a24;
+      padding: 9px 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      width: 100%;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+    .tabs button.active { background: #204232; border-color: #5aa97b; color: #deffe9; }
+    .btn.primary { background: var(--accent-soft); border-color: #5aa97b; color: #e7fff0; }
+    .btn.danger { background: #3f2323; border-color: #8a4c4c; color: #ffdcdc; }
+    .panel-scroll {
+      overflow: auto;
+      padding-right: 2px;
       display: grid;
       gap: 10px;
       align-content: start;
-      position: sticky;
-      top: 10px;
-      max-height: calc(100vh - 20px);
-      overflow-y: auto;
-      overflow-x: hidden;
     }
-    .controls h2 {
-      margin: 0;
-      font-size: 16px;
-    }
-    .help {
-      margin: 0;
-      font-size: 12px;
-      color: var(--muted);
-      line-height: 1.35;
-    }
-    .panel-section {
-      background: var(--panel-2);
+    .tab { display: none; gap: 10px; align-content: start; }
+    .tab.active { display: grid; }
+    .section {
+      background: var(--panel-soft);
       border: 1px solid var(--line);
       border-radius: 12px;
       padding: 10px;
       display: grid;
       gap: 8px;
     }
-    .section-title {
-      margin: 0;
-      font-size: 13px;
-      font-weight: 700;
-      color: #d8fbe5;
-      letter-spacing: .01em;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-      gap: 8px;
-    }
-    .field {
-      display: grid;
-      gap: 4px;
-      min-width: 0;
-    }
-    .field.full {
-      grid-column: 1 / -1;
-    }
-    .field label {
-      font-size: 12px;
-      color: var(--muted);
-    }
-    input, select, button {
+    .section h3 { margin: 0; font-size: 14px; }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.3; }
+    .grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+    .field { display: grid; gap: 4px; }
+    .field.full { grid-column: 1 / -1; }
+    .field label { color: var(--muted); font-size: 12px; font-weight: 600; }
+    select, input, textarea {
       border-radius: 10px;
-      border: 1px solid var(--line);
-      background: #101712;
+      border: 1px solid #3a4d44;
+      background: #101713;
       color: var(--ink);
-      padding: 9px 10px;
+      padding: 8px 9px;
       font-size: 13px;
       width: 100%;
-      min-width: 0;
     }
-    button {
-      cursor: pointer;
-      background: #1b2a21;
-      border-color: #2f4639;
-    }
-    button:hover { border-color: #5c896f; }
-    button.accent { background: #1d3a2b; border-color: #3e875f; color: #cbffe0; }
-    .primary-actions {
+    textarea { min-height: 92px; resize: vertical; }
+    .actions {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 8px;
-    }
-    .secondary-actions {
-      display: grid;
       grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 8px;
     }
-    .advanced {
+    .chat {
       border: 1px solid var(--line);
-      border-radius: 12px;
-      background: #121a15;
-      overflow: hidden;
-    }
-    .advanced summary {
-      cursor: pointer;
-      list-style: none;
-      padding: 10px;
-      font-size: 13px;
-      font-weight: 700;
-      color: #cdebd8;
-      background: #17231c;
-      border-bottom: 1px solid var(--line);
-    }
-    .advanced summary::-webkit-details-marker { display: none; }
-    .advanced[open] summary { background: #1a2a20; }
-    .advanced-inner {
-      padding: 10px;
+      border-radius: 10px;
+      background: #101712;
+      max-height: 280px;
+      overflow: auto;
+      padding: 8px;
       display: grid;
-      gap: 8px;
+      gap: 6px;
+      font-size: 12px;
     }
+    .msg { padding: 7px 8px; border: 1px solid #2d4037; border-radius: 8px; background: #111b16; }
+    .msg .meta { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
     .stats {
-      background: var(--panel-2);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 10px;
-      display: grid;
-      gap: 5px;
       font-size: 12px;
       color: var(--muted);
+      display: grid;
+      gap: 6px;
     }
-    .stats .strong { color: #dcffe7; font-weight: 600; }
-    @media (max-width: 1300px) {
-      .main { grid-template-columns: 1fr; }
+    .chip-row {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    }
+    .chip {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #13201a;
+      padding: 8px;
+      font-size: 12px;
+    }
+    .badge { color: var(--warn); font-weight: 600; }
+    .hidden { display: none !important; }
+    .spacer { height: 2px; }
+    .layout {
+      align-items: start;
+    }
+    @media (max-width: 1480px) {
+      .layout { grid-template-columns: minmax(0, 1.7fr) minmax(360px, 1fr); }
+      .tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 1260px) {
+      .bar-row { grid-template-columns: 1fr; }
+      .layout { grid-template-columns: 1fr; }
       .feeds { grid-template-columns: 1fr; }
-      .controls {
-        position: static;
-        max-height: none;
-        overflow: visible;
-      }
-    }
-    @media (max-width: 820px) {
-      .row { grid-template-columns: 1fr; }
-      .grid { grid-template-columns: 1fr; }
-      .primary-actions { grid-template-columns: 1fr; }
-      .secondary-actions { grid-template-columns: 1fr; }
-      .shell { padding: 10px; }
+      .side { max-height: none; }
+      .tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
 <body>
   <div class="shell">
-    <section class="top">
-      <h1>Emergency Communication Platform</h1>
-      <div class="row">
-        <div class="status" id="statusText">Initializing...</div>
+    <section class="topbar">
+      <div class="bar-row">
+        <div class="title">
+          <h1>Emergency Communicator</h1>
+          <div class="status" id="statusText">Booting communicator...</div>
+        </div>
         <div class="meter">
-          <progress id="bwBar" max="120" value="0"></progress>
+          <progress id="bwBar" max="220" value="0"></progress>
           <div id="bwText">live 0.00 kbps | smooth 0.00 kbps | avg 0.00 kbps</div>
         </div>
       </div>
-    </section>
-
-    <section class="main">
-      <div class="feeds">
-        <article class="card">
-          <div class="label">Raw Input</div>
-          <img id="feedRaw" class="feedimg" alt="raw" />
-        </article>
-        <article class="card">
-          <div class="label">Sent (Dithered)</div>
-          <img id="feedSent" class="feedimg" alt="sent" />
-        </article>
-        <article class="card">
-          <div class="label">Received (Reconstructed)</div>
-          <img id="feedReceived" class="feedimg" alt="received" />
-        </article>
+      <div class="chip-row">
+        <div class="chip" id="chipTransport">transport --</div>
+        <div class="chip" id="chipRole">role --</div>
+        <div class="chip" id="chipSync">sync --</div>
+        <div class="chip" id="chipQueue">queue --</div>
       </div>
-
-      <aside class="controls">
-        <h2>Easy Controls</h2>
-        <p class="help">Pick camera and quality, press Apply Settings, then Start Link. Open Advanced only if you need technical tuning.</p>
-
-        <section class="panel-section">
-          <h3 class="section-title">Basic Setup</h3>
-          <div class="grid">
-            <div class="field">
-              <label for="cameraSelect">Camera</label>
-              <select id="cameraSelect"></select>
-            </div>
-            <div class="field">
-              <label for="modeSelect">Quality Mode</label>
-              <select id="modeSelect">
-                <option value="safer">Safer (Recommended)</option>
-                <option value="aggressive">Low Bandwidth</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="resSelect">Resolution</label>
-              <select id="resSelect">
-                <option value="96x72">96x72 (Lowest Data)</option>
-                <option value="128x96">128x96 (Balanced)</option>
-                <option value="160x120">160x120 (Clearer)</option>
-                <option value="192x144">192x144 (Highest)</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="fpsInput">Update Speed (FPS)</label>
-              <input id="fpsInput" type="number" step="0.1" min="0.2" />
-            </div>
-          </div>
-          <div class="primary-actions">
-            <button id="applyBtn" class="accent">Apply Settings</button>
-            <button id="startLinkBtn" class="accent">Start Link</button>
-            <button id="stopLinkBtn">Stop Link</button>
-          </div>
-        </section>
-
-        <section class="panel-section">
-          <h3 class="section-title">Image Clarity</h3>
-          <div class="secondary-actions">
-            <button id="enhanceBtn">Enhancement: On</button>
-            <button id="ditherBtn">Dithering: Off</button>
-          </div>
-        </section>
-
-        <details class="advanced" id="advancedSettings">
-          <summary>Advanced Technical Settings (Optional)</summary>
-          <div class="advanced-inner">
-            <div class="grid">
-              <div class="field">
-                <label for="linkModeSelect">Link Mode</label>
-                <select id="linkModeSelect">
-                  <option value="local_loopback">Local Test</option>
-                  <option value="acoustic_tx">Send by Speaker</option>
-                  <option value="acoustic_rx_live">Receive by Microphone</option>
-                  <option value="acoustic_rx_media">Receive from Media File</option>
-                  <option value="acoustic_duplex_arq">Two-way ARQ (Advanced)</option>
-                </select>
+    </section>
+    <section class="layout">
+      <div class="feeds">
+        <article class="card"><div class="label">Raw Input</div><img id="feedRaw" class="feedimg" alt="raw" /></article>
+        <article class="card"><div class="label">Sent Stream</div><img id="feedSent" class="feedimg" alt="sent" /></article>
+        <article class="card"><div class="label">Received Stream</div><img id="feedReceived" class="feedimg" alt="received" /></article>
+      </div>
+      <aside class="side">
+        <div class="tabs">
+          <button id="tabBtnLink" class="active">Link</button>
+          <button id="tabBtnSend">Send</button>
+          <button id="tabBtnReceive">Receive</button>
+          <button id="tabBtnStatus">Status</button>
+          <button id="tabBtnAdvanced">Advanced</button>
+        </div>
+        <div class="panel-scroll">
+          <section id="tabLink" class="tab active">
+            <div class="section">
+              <h3>Quick Setup</h3>
+              <div class="hint">Use this section for normal operation. Advanced transport tuning is in the Advanced tab.</div>
+              <div class="grid">
+                <div class="field"><label>Node Alias</label><input id="aliasInput" type="text" /></div>
+                <div class="field"><label>Camera</label><select id="cameraSelect"></select></div>
+                <div class="field"><label>Transport</label><select id="transportSelect"><option value="acoustic">Acoustic</option><option value="serial">Serial</option><option value="optical">Optical</option><option value="file_relay">File Relay</option></select></div>
+                <div class="field"><label>Role</label><select id="roleSelect"><option value="duplex">Duplex</option><option value="send">Send</option><option value="receive">Receive</option></select></div>
+                <div class="field"><label>Quality</label><select id="modeSelect"><option value="safer">Safer</option><option value="aggressive">Aggressive</option></select></div>
+                <div class="field"><label>Resolution</label><select id="resSelect"><option value="96x72">96x72</option><option value="128x96">128x96</option><option value="160x120">160x120</option><option value="192x144">192x144</option></select></div>
+                <div class="field"><label>Target FPS</label><input id="fpsInput" type="number" min="0.2" step="0.1" /></div>
               </div>
-              <div class="field">
-                <label for="rxSourceSelect">Receive Source</label>
-                <select id="rxSourceSelect">
-                  <option value="live_mic">Live Microphone</option>
-                  <option value="media_file">Media File</option>
-                </select>
-              </div>
-              <div class="field">
-                <label for="sessionModeSelect">Session Mode</label>
-                <select id="sessionModeSelect">
-                  <option value="broadcast">Broadcast</option>
-                  <option value="duplex_arq">Duplex ARQ</option>
-                </select>
-              </div>
-              <div class="field">
-                <label for="bandModeSelect">Audio Band</label>
-                <select id="bandModeSelect">
-                  <option value="audible">Audible</option>
-                  <option value="ultrasonic">Ultrasonic</option>
-                </select>
-              </div>
-              <div class="field">
-                <label for="audioInSelect">Audio Input Device</label>
-                <select id="audioInSelect"></select>
-              </div>
-              <div class="field">
-                <label for="audioOutSelect">Audio Output Device</label>
-                <select id="audioOutSelect"></select>
-              </div>
-              <div class="field full">
-                <label for="mediaPathInput">Media File Path</label>
-                <input id="mediaPathInput" type="text" placeholder="/path/to/file.mp4" />
+              <div class="actions">
+                <button id="applyBtn" class="btn primary">Apply Settings</button>
+                <button id="startBtn" class="btn primary">Start Link</button>
+                <button id="stopBtn" class="btn danger">Stop Link</button>
               </div>
             </div>
+          </section>
 
-            <div class="secondary-actions">
-              <button id="keyBtn">Keyframe Interval: Default</button>
-              <button id="forceKfBtn">Force Keyframe</button>
-              <button id="recordBtn">Recording: Off</button>
-              <button id="rescanBtn">Rescan Cameras/Audio</button>
+          <section id="tabSend" class="tab">
+            <div class="section">
+              <h3>Reliable Text Channel</h3>
+              <div class="grid">
+                <div class="field"><label>Target Scope</label><select id="textScopeSelect"><option value="broadcast">Broadcast</option><option value="direct">Direct</option></select></div>
+                <div class="field"><label>Target Node ID</label><input id="textTargetInput" type="number" min="0" step="1" value="0" /></div>
+                <div class="field full"><label>Message</label><textarea id="textBodyInput" placeholder="Type emergency message..."></textarea></div>
+              </div>
+              <div class="actions">
+                <button id="sendTextBtn" class="btn primary">Send Message</button>
+                <button id="quickNeedBtn" class="btn">Quick: Need Help</button>
+                <button id="quickSafeBtn" class="btn">Quick: Safe Here</button>
+                <button id="quickMoveBtn" class="btn">Quick: Move North</button>
+              </div>
             </div>
-          </div>
-        </details>
+            <div class="section">
+              <h3>Message Timeline</h3>
+              <div id="chatLog" class="chat"></div>
+            </div>
+          </section>
 
-        <div class="stats">
-          <div id="statFrame" class="strong">frame --</div>
-          <div id="statCodec">codec --</div>
-          <div id="statLink">link --</div>
-          <div id="statComp">compression --</div>
-          <div id="statQuality">quality --</div>
-          <div id="statFaces">faces --</div>
+          <section id="tabReceive" class="tab">
+            <div class="section">
+              <h3>Receive & Relay</h3>
+              <div class="grid">
+                <div class="field full"><label>Relay Export Bundle</label><input id="relayExportInput" type="text" placeholder="./relay_out/export.evrelay" /></div>
+                <div class="field full"><label>Relay Import Bundle</label><input id="relayImportInput" type="text" placeholder="./relay_in/import.evrelay" /></div>
+              </div>
+              <div class="actions">
+                <button id="exportRelayBtn" class="btn">Export Relay Bundle</button>
+                <button id="importRelayBtn" class="btn">Import Relay Bundle</button>
+              </div>
+            </div>
+          </section>
+
+          <section id="tabStatus" class="tab">
+            <div class="section stats">
+              <div id="statTransport">transport --</div>
+              <div id="statFallback">fallback --</div>
+              <div id="statQueue">queue --</div>
+              <div id="statCodec">codec --</div>
+              <div id="statLink">link --</div>
+              <div id="statQuality">quality --</div>
+              <div id="statFaces">faces --</div>
+            </div>
+          </section>
+
+          <section id="tabAdvanced" class="tab">
+            <div class="section">
+              <h3>Codec & Display</h3>
+              <div class="actions">
+                <button id="keyBtn" class="btn">Keyframe Interval</button>
+                <button id="enhanceBtn" class="btn">Enhancement</button>
+                <button id="ditherBtn" class="btn">Dithering</button>
+                <button id="recordBtn" class="btn">Recording</button>
+                <button id="forceKfBtn" class="btn">Force Keyframe</button>
+                <button id="rescanBtn" class="btn">Rescan Devices</button>
+              </div>
+            </div>
+
+            <div class="section" id="acousticSection">
+              <h3>Acoustic Link</h3>
+              <div class="grid">
+                <div class="field"><label>RX Source</label><select id="rxSourceSelect"><option value="live_mic">Live Mic</option><option value="media_file">Media File</option></select></div>
+                <div class="field"><label>Session</label><select id="sessionModeSelect"><option value="broadcast">Broadcast</option><option value="duplex_arq">Duplex ARQ</option></select></div>
+                <div class="field"><label>Band</label><select id="bandModeSelect"><option value="audible">Audible</option><option value="ultrasonic">Ultrasonic</option></select></div>
+                <div class="field"><label>Audio Input</label><select id="audioInSelect"></select></div>
+                <div class="field"><label>Audio Output</label><select id="audioOutSelect"></select></div>
+                <div class="field full"><label>Media Path</label><input id="mediaPathInput" type="text" placeholder="/path/to/recording.mp4" /></div>
+              </div>
+            </div>
+
+            <div class="section" id="serialSection">
+              <h3>Serial Link</h3>
+              <div class="grid">
+                <div class="field"><label>Serial Port</label><input id="serialPortInput" type="text" placeholder="/dev/cu.usbserial-*" /></div>
+                <div class="field"><label>Serial Baud</label><input id="serialBaudInput" type="number" min="1200" step="1" value="115200" /></div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3>Relay Paths</h3>
+              <div class="grid">
+                <div class="field full"><label>Export Path</label><input id="relayExportAdvInput" type="text" placeholder="./relay_out/export.evrelay" /></div>
+                <div class="field full"><label>Import Path</label><input id="relayImportAdvInput" type="text" placeholder="./relay_in/import.evrelay" /></div>
+              </div>
+            </div>
+
+            <div class="actions">
+              <button id="applyAdvancedBtn" class="btn primary">Apply Advanced</button>
+            </div>
+          </section>
         </div>
       </aside>
     </section>
   </div>
 
   <script>
-    const stateStore = {
-      latest: null,
-      refreshFramesEveryMs: 160,
-      refreshStateEveryMs: 600,
-      formInitialized: false,
-      formDirty: false,
-      applyInFlight: false
-    };
+    const stateStore = { latest: null, formDirty: false, cursor: 0 };
+
+    const TAB_IDS = ['Link', 'Send', 'Receive', 'Status', 'Advanced'];
+    function setTab(name) {
+      TAB_IDS.forEach(t => {
+        document.getElementById(`tabBtn${t}`).classList.toggle('active', t === name);
+        document.getElementById(`tab${t}`).classList.toggle('active', t === name);
+      });
+    }
 
     function num(v, d = 0) {
       const n = Number(v);
       return Number.isFinite(n) ? n : d;
     }
 
-    async function callControl(params) {
-      const query = new URLSearchParams(params);
-      query.set('_ts', String(Date.now()));
-      await fetch('/api/control?' + query.toString(), { cache: 'no-store' });
+    function text(v, d = '') {
+      return (typeof v === 'string' && v.length > 0) ? v : d;
     }
 
-    function updateCameraOptions(cameras, current, forceCurrentSelection) {
-      const sel = document.getElementById('cameraSelect');
-      const existing = new Set(Array.from(sel.options).map(o => Number(o.value)));
-      const next = Array.isArray(cameras) ? cameras.map(Number) : [];
-      const previousValue = sel.value;
+    async function postJson(url, body) {
+      await fetch(url, {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+      });
+    }
 
-      for (const id of next) {
-        if (!existing.has(id)) {
+    async function refreshState() {
+      try {
+        const resp = await fetch('/api/v2/state', { cache: 'no-store' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        stateStore.latest = data;
+        renderState(data);
+      } catch (_) {}
+    }
+
+    function renderMessages(messages) {
+      const chat = document.getElementById('chatLog');
+      const msgArr = Array.isArray(messages) ? messages : [];
+      chat.innerHTML = '';
+      for (const m of msgArr) {
+        const div = document.createElement('div');
+        div.className = 'msg';
+        const scope = m.scope || 'broadcast';
+        const state = Number(m.state || 0);
+        const stateLabel = ['queued', 'sent', 'acked', 'relayed', 'failed'][state] || 'unknown';
+        div.innerHTML = `<div class="meta">#${m.msg_id} from ${m.sender} to ${scope}${scope === 'direct' ? ':' + m.target : ''} <span class="badge">${stateLabel}</span></div><div>${m.body || ''}</div>`;
+        chat.appendChild(div);
+      }
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function syncSelectOptions(selectEl, entries, current, labelFn) {
+      const list = Array.isArray(entries) ? entries : [];
+      const seen = new Set(Array.from(selectEl.options).map(o => String(o.value)));
+      for (const entry of list) {
+        const value = String(typeof entry === 'object' ? entry.index : entry);
+        if (!seen.has(value)) {
           const opt = document.createElement('option');
-          opt.value = String(id);
-          opt.textContent = `Camera ${id}`;
-          sel.appendChild(opt);
+          opt.value = value;
+          opt.textContent = labelFn(entry);
+          selectEl.appendChild(opt);
         }
       }
-
-      Array.from(sel.options).forEach(opt => {
-        if (!next.includes(Number(opt.value))) {
-          sel.removeChild(opt);
+      Array.from(selectEl.options).forEach(o => {
+        if (!list.some(e => String(typeof e === 'object' ? e.index : e) === o.value)) {
+          selectEl.removeChild(o);
         }
       });
-
-      if (forceCurrentSelection && current !== undefined && current !== null) {
-        sel.value = String(current);
-        return;
-      }
-
-      if (previousValue && next.includes(Number(previousValue))) {
-        sel.value = previousValue;
-      } else if (next.length > 0) {
-        sel.value = String(next[0]);
+      if (current !== undefined && current !== null) {
+        selectEl.value = String(current);
       }
     }
 
-    function updateAudioOptions(selectId, devices, current) {
-      const sel = document.getElementById(selectId);
-      const existing = new Set(Array.from(sel.options).map(o => Number(o.value)));
-      const next = Array.isArray(devices) ? devices : [];
-      const previousValue = sel.value;
-
-      for (const dev of next) {
-        const id = Number(dev.index);
-        if (!existing.has(id)) {
-          const opt = document.createElement('option');
-          opt.value = String(id);
-          opt.textContent = dev.default ? `${dev.name} (Default)` : dev.name;
-          sel.appendChild(opt);
-        }
-      }
-
-      Array.from(sel.options).forEach(opt => {
-        if (!next.some(d => Number(d.index) === Number(opt.value))) {
-          sel.removeChild(opt);
-        }
-      });
-
-      if (current !== undefined && next.some(d => Number(d.index) === Number(current))) {
-        sel.value = String(current);
-      } else if (previousValue && next.some(d => Number(d.index) === Number(previousValue))) {
-        sel.value = previousValue;
-      } else if (next.length > 0) {
-        sel.value = String(next[0].index);
-      }
+    function syncContextVisibility(data) {
+      const transport = text(data.transport_kind, 'acoustic');
+      document.getElementById('acousticSection').classList.toggle('hidden', transport !== 'acoustic');
+      document.getElementById('serialSection').classList.toggle('hidden', transport !== 'serial');
     }
 
     function renderState(data) {
-      stateStore.latest = data;
-
       document.getElementById('statusText').textContent =
-        `cam ${data.camera} | mode ${data.mode} | ${data.resolution} | fps target ${num(data.target_fps).toFixed(1)} | link ${data.link_mode} (${data.link_running ? 'on' : 'off'}) | ${data.status}`;
+        `node ${data.node_alias || '-'} | mode ${data.mode} ${data.resolution} | ${data.status}`;
 
       const live = num(data.metrics?.live_kbps);
       const smooth = num(data.metrics?.smooth_kbps);
       const avg = num(data.metrics?.avg_kbps);
-      const bwBar = document.getElementById('bwBar');
-      bwBar.value = Math.max(0, Math.min(120, smooth));
-      document.getElementById('bwText').textContent =
-        `live ${live.toFixed(2)} kbps | smooth ${smooth.toFixed(2)} kbps | avg ${avg.toFixed(2)} kbps`;
+      document.getElementById('bwBar').value = Math.max(0, Math.min(220, smooth));
+      document.getElementById('bwText').textContent = `live ${live.toFixed(2)} kbps | smooth ${smooth.toFixed(2)} kbps | avg ${avg.toFixed(2)} kbps`;
 
-      const shouldSyncForm = !stateStore.formDirty && !stateStore.applyInFlight;
-      if (!stateStore.formInitialized || shouldSyncForm) {
-        document.getElementById('modeSelect').value = data.mode;
-        document.getElementById('resSelect').value = data.resolution;
-        document.getElementById('fpsInput').value = Number(data.target_fps).toFixed(1);
-        document.getElementById('linkModeSelect').value = data.link_mode;
-        document.getElementById('rxSourceSelect').value = data.rx_source;
-        document.getElementById('sessionModeSelect').value = data.session_mode;
-        document.getElementById('bandModeSelect').value = data.band_mode;
+      syncSelectOptions(document.getElementById('cameraSelect'), data.cameras || [], data.camera, id => `Camera ${id}`);
+      syncSelectOptions(document.getElementById('audioInSelect'), data.audio_inputs || [], data.audio_in_device, d => d.default ? `${d.name} (Default)` : d.name);
+      syncSelectOptions(document.getElementById('audioOutSelect'), data.audio_outputs || [], data.audio_out_device, d => d.default ? `${d.name} (Default)` : d.name);
+
+      if (!stateStore.formDirty) {
+        document.getElementById('aliasInput').value = data.node_alias || '';
+        document.getElementById('modeSelect').value = data.mode || 'safer';
+        document.getElementById('resSelect').value = data.resolution || '128x96';
+        document.getElementById('fpsInput').value = num(data.target_fps, 2.5).toFixed(1);
+        document.getElementById('transportSelect').value = data.transport_kind || 'acoustic';
+        document.getElementById('roleSelect').value = data.link_role || 'duplex';
+        document.getElementById('rxSourceSelect').value = data.rx_source || 'live_mic';
+        document.getElementById('sessionModeSelect').value = data.session_mode || 'broadcast';
+        document.getElementById('bandModeSelect').value = data.band_mode || 'audible';
         document.getElementById('mediaPathInput').value = data.media_path || '';
-        updateCameraOptions(data.cameras || [], data.camera, true);
-        updateAudioOptions('audioInSelect', data.audio_inputs || [], data.audio_in_device);
-        updateAudioOptions('audioOutSelect', data.audio_outputs || [], data.audio_out_device);
-        stateStore.formInitialized = true;
-      } else {
-        updateCameraOptions(data.cameras || [], data.camera, false);
-        updateAudioOptions('audioInSelect', data.audio_inputs || [], data.audio_in_device);
-        updateAudioOptions('audioOutSelect', data.audio_outputs || [], data.audio_out_device);
+        document.getElementById('serialPortInput').value = data.serial_port || '';
+        document.getElementById('serialBaudInput').value = num(data.serial_baud, 115200).toFixed(0);
+        document.getElementById('relayExportInput').value = data.relay_export_path || '';
+        document.getElementById('relayImportInput').value = data.relay_import_path || '';
+        document.getElementById('relayExportAdvInput').value = data.relay_export_path || '';
+        document.getElementById('relayImportAdvInput').value = data.relay_import_path || '';
       }
 
-      document.getElementById('keyBtn').textContent = `Keyframe Interval: ${data.short_keyframe ? 'Short' : 'Default'}`;
+      document.getElementById('startBtn').disabled = !!data.link_running;
+      document.getElementById('stopBtn').disabled = !data.link_running;
+      document.getElementById('keyBtn').textContent = `Keyframe: ${data.short_keyframe ? 'Short' : 'Default'}`;
       document.getElementById('enhanceBtn').textContent = `Enhancement: ${data.enhance ? 'On' : 'Off'}`;
       document.getElementById('ditherBtn').textContent = `Dithering: ${data.dither ? 'On' : 'Off'}`;
       document.getElementById('recordBtn').textContent = `Recording: ${data.recording ? 'On' : 'Off'}`;
-      document.getElementById('startLinkBtn').disabled = !!data.link_running;
-      document.getElementById('stopLinkBtn').disabled = !data.link_running;
 
-      const f = data.frame || {};
-      document.getElementById('statFrame').textContent =
-        `frame ${f.index ?? '--'} [${f.type ?? '-'}] bytes ${num(data.packet_bytes).toFixed(0)}`;
+      document.getElementById('chipTransport').textContent =
+        `transport ${data.transport_kind} | ${data.transport_status || '-'}`;
+      document.getElementById('chipRole').textContent =
+        `role ${data.link_role || '-'} | link ${data.link_running ? 'running' : 'stopped'}`;
+      document.getElementById('chipSync').textContent =
+        `sync ${data.link_stats?.sync_locked ? 'locked' : 'searching'} | payload ${num(data.link_stats?.effective_payload_kbps).toFixed(2)} kbps`;
+      document.getElementById('chipQueue').textContent =
+        `Q text ${num(data.queue?.text).toFixed(0)} | video ${num(data.queue?.video).toFixed(0)} | dropped ${num(data.queue?.dropped).toFixed(0)}`;
+
+      document.getElementById('statTransport').textContent =
+        `transport ${data.transport_kind} | status ${data.transport_status || '-'} | role ${data.link_role || '-'}`;
+      document.getElementById('statFallback').textContent =
+        `fallback stage ${num(data.fallback_stage).toFixed(0)} | queue dropped ${num(data.queue?.dropped).toFixed(0)}`;
+      document.getElementById('statQueue').textContent =
+        `Q config ${num(data.queue?.config).toFixed(0)} ack ${num(data.queue?.ack).toFixed(0)} text ${num(data.queue?.text).toFixed(0)} snap ${num(data.queue?.snapshot).toFixed(0)} video ${num(data.queue?.video).toFixed(0)} inflight ${num(data.queue?.inflight).toFixed(0)}`;
       document.getElementById('statCodec').textContent =
-        `encoded fps ${num(data.metrics?.fps).toFixed(2)} | key-int ${num(data.keyframe_interval).toFixed(0)} | changed ${num(data.metrics?.changed_percent).toFixed(1)}%`;
+        `fps ${num(data.metrics?.fps).toFixed(2)} key-int ${num(data.keyframe_interval).toFixed(0)} changed ${num(data.metrics?.changed_percent).toFixed(1)}%`;
       document.getElementById('statLink').textContent =
-        `sync ${data.link_stats?.sync_locked ? 'locked' : 'searching'} | BER ${num(data.link_stats?.ber).toFixed(5)} | fec fix ${num(data.link_stats?.fec_recovered).toFixed(0)} | rtx ${num(data.link_stats?.retransmit_count).toFixed(0)} | slot ${data.link_tx_slot ? 'tx' : 'rx'}`;
-      document.getElementById('statComp').textContent =
-        `ratio raw4 ${num(data.metrics?.ratio_raw4).toFixed(2)}x | raw8 ${num(data.metrics?.ratio_raw8).toFixed(2)}x`;
+        `sync ${data.link_stats?.sync_locked ? 'locked' : 'searching'} ber ${num(data.link_stats?.ber).toFixed(5)} rtx ${num(data.link_stats?.retransmit_count).toFixed(0)} payload ${num(data.link_stats?.effective_payload_kbps).toFixed(2)} kbps`;
       document.getElementById('statQuality').textContent =
-        `PSNR ${num(data.metrics?.psnr).toFixed(2)} dB | keyframes ${num(data.metrics?.keyframe_percent).toFixed(1)}%`;
+        `ratio4 ${num(data.metrics?.ratio_raw4).toFixed(2)}x ratio8 ${num(data.metrics?.ratio_raw8).toFixed(2)}x PSNR ${num(data.metrics?.psnr).toFixed(2)} dB`;
       document.getElementById('statFaces').textContent =
-        `faces now ${num(data.faces_now).toFixed(0)} | gathered ${num(data.faces_gathered).toFixed(0)} | detector ${data.face_detector ? 'on' : 'missing'}`;
+        `faces now ${num(data.faces_now).toFixed(0)} gathered ${num(data.faces_gathered).toFixed(0)} detector ${data.face_detector ? 'on' : 'off'}`;
+
+      renderMessages(data.messages || []);
+      stateStore.cursor = Math.max(stateStore.cursor, num(data.latest_text_cursor));
+      syncContextVisibility(data);
     }
 
-    async function pollState() {
-      try {
-        const resp = await fetch('/api/state', { cache: 'no-store' });
-        if (!resp.ok) return;
-        const data = await resp.json();
-        renderState(data);
-      } catch (_) {
+    function refreshFrames() {
+      const ts = Date.now();
+      document.getElementById('feedRaw').src = `/api/v2/frame/raw.jpg?t=${ts}`;
+      document.getElementById('feedSent').src = `/api/v2/frame/sent.jpg?t=${ts}`;
+      document.getElementById('feedReceived').src = `/api/v2/frame/received.jpg?t=${ts}`;
+    }
+
+    function collectControl() {
+      return {
+        mode: document.getElementById('modeSelect').value,
+        resolution: document.getElementById('resSelect').value,
+        target_fps: document.getElementById('fpsInput').value,
+        camera: document.getElementById('cameraSelect').value,
+        link_role: document.getElementById('roleSelect').value,
+        rx_source: document.getElementById('rxSourceSelect').value,
+        session_mode: document.getElementById('sessionModeSelect').value,
+        band_mode: document.getElementById('bandModeSelect').value,
+        audio_in_device: document.getElementById('audioInSelect').value,
+        audio_out_device: document.getElementById('audioOutSelect').value,
+        media_path: document.getElementById('mediaPathInput').value,
+        transport_kind: document.getElementById('transportSelect').value,
+        serial_port: document.getElementById('serialPortInput').value,
+        serial_baud: document.getElementById('serialBaudInput').value,
+        node_alias: document.getElementById('aliasInput').value,
+        relay_export_path: document.getElementById('relayExportAdvInput').value || document.getElementById('relayExportInput').value,
+        relay_import_path: document.getElementById('relayImportAdvInput').value || document.getElementById('relayImportInput').value
+      };
+    }
+
+    async function applyControl(extra) {
+      const body = Object.assign(collectControl(), extra || {});
+      await postJson('/api/v2/control', body);
+      stateStore.formDirty = false;
+      await refreshState();
+    }
+
+    function bind() {
+      document.getElementById('tabBtnLink').onclick = () => setTab('Link');
+      document.getElementById('tabBtnSend').onclick = () => setTab('Send');
+      document.getElementById('tabBtnReceive').onclick = () => setTab('Receive');
+      document.getElementById('tabBtnStatus').onclick = () => setTab('Status');
+      document.getElementById('tabBtnAdvanced').onclick = () => setTab('Advanced');
+
+      ['aliasInput','cameraSelect','modeSelect','resSelect','fpsInput','transportSelect','roleSelect','rxSourceSelect',
+       'sessionModeSelect','bandModeSelect','audioInSelect','audioOutSelect','mediaPathInput','serialPortInput','serialBaudInput',
+       'relayExportInput','relayImportInput','relayExportAdvInput','relayImportAdvInput']
+        .forEach(id => document.getElementById(id).addEventListener('input', () => { stateStore.formDirty = true; }));
+
+      document.getElementById('applyBtn').onclick = async () => applyControl({});
+      document.getElementById('applyAdvancedBtn').onclick = async () => applyControl({});
+      document.getElementById('startBtn').onclick = async () => postJson('/api/v2/link/start', {});
+      document.getElementById('stopBtn').onclick = async () => postJson('/api/v2/link/stop', {});
+      document.getElementById('forceKfBtn').onclick = async () => applyControl({ force_keyframe: true });
+      document.getElementById('rescanBtn').onclick = async () => applyControl({ rescan_cameras: true, rescan_audio: true });
+      document.getElementById('keyBtn').onclick = async () => applyControl({ short_keyframe: !(stateStore.latest?.short_keyframe) });
+      document.getElementById('enhanceBtn').onclick = async () => applyControl({ enhance: !(stateStore.latest?.enhance) });
+      document.getElementById('ditherBtn').onclick = async () => applyControl({ dither: !(stateStore.latest?.dither) });
+      document.getElementById('recordBtn').onclick = async () => applyControl({ recording: !(stateStore.latest?.recording) });
+      document.getElementById('exportRelayBtn').onclick = async () => applyControl({ export_relay: true });
+      document.getElementById('importRelayBtn').onclick = async () => applyControl({ import_relay: true });
+
+      async function sendText(text) {
+        await postJson('/api/v2/messages/send', {
+          body: text,
+          scope: document.getElementById('textScopeSelect').value,
+          target_node_id: Number(document.getElementById('textTargetInput').value || 0)
+        });
       }
+
+      document.getElementById('sendTextBtn').onclick = async () => {
+        const box = document.getElementById('textBodyInput');
+        const text = (box.value || '').trim();
+        if (!text) return;
+        await sendText(text);
+        box.value = '';
+      };
+      document.getElementById('quickNeedBtn').onclick = async () => sendText('Need medical help at current location.');
+      document.getElementById('quickSafeBtn').onclick = async () => sendText('We are safe and holding position.');
+      document.getElementById('quickMoveBtn').onclick = async () => sendText('Moving north to extraction point.');
     }
 
-    function refreshFeeds() {
-      const stamp = Date.now();
-      document.getElementById('feedRaw').src = `/api/frame/raw.jpg?t=${stamp}`;
-      document.getElementById('feedSent').src = `/api/frame/sent.jpg?t=${stamp}`;
-      document.getElementById('feedReceived').src = `/api/frame/received.jpg?t=${stamp}`;
-    }
-
-    function setupEvents() {
-      const markDirty = () => { stateStore.formDirty = true; };
-      document.getElementById('cameraSelect').addEventListener('change', markDirty);
-      document.getElementById('linkModeSelect').addEventListener('change', markDirty);
-      document.getElementById('modeSelect').addEventListener('change', markDirty);
-      document.getElementById('resSelect').addEventListener('change', markDirty);
-      document.getElementById('rxSourceSelect').addEventListener('change', markDirty);
-      document.getElementById('sessionModeSelect').addEventListener('change', markDirty);
-      document.getElementById('bandModeSelect').addEventListener('change', markDirty);
-      document.getElementById('audioInSelect').addEventListener('change', markDirty);
-      document.getElementById('audioOutSelect').addEventListener('change', markDirty);
-      document.getElementById('fpsInput').addEventListener('input', markDirty);
-      document.getElementById('mediaPathInput').addEventListener('input', markDirty);
-
-      document.getElementById('applyBtn').addEventListener('click', async () => {
-        if (stateStore.applyInFlight) {
-          return;
-        }
-        stateStore.applyInFlight = true;
-        const applyBtn = document.getElementById('applyBtn');
-        applyBtn.disabled = true;
-        try {
-          await callControl({
-            mode: document.getElementById('modeSelect').value,
-            resolution: document.getElementById('resSelect').value,
-            target_fps: document.getElementById('fpsInput').value,
-            camera: document.getElementById('cameraSelect').value,
-            link_mode: document.getElementById('linkModeSelect').value,
-            rx_source: document.getElementById('rxSourceSelect').value,
-            session_mode: document.getElementById('sessionModeSelect').value,
-            band_mode: document.getElementById('bandModeSelect').value,
-            audio_in_device: document.getElementById('audioInSelect').value,
-            audio_out_device: document.getElementById('audioOutSelect').value,
-            media_path: document.getElementById('mediaPathInput').value
-          });
-          stateStore.formDirty = false;
-          await pollState();
-        } finally {
-          stateStore.applyInFlight = false;
-          applyBtn.disabled = false;
-        }
-      });
-
-      document.getElementById('rescanBtn').addEventListener('click', async () => {
-        await callControl({ rescan_cameras: '1', rescan_audio: '1' });
-      });
-
-      document.getElementById('startLinkBtn').addEventListener('click', async () => {
-        await callControl({ start_link: '1' });
-      });
-
-      document.getElementById('stopLinkBtn').addEventListener('click', async () => {
-        await callControl({ stop_link: '1' });
-      });
-
-      document.getElementById('forceKfBtn').addEventListener('click', async () => {
-        await callControl({ force_keyframe: '1' });
-      });
-
-      document.getElementById('keyBtn').addEventListener('click', async () => {
-        const next = !(stateStore.latest?.short_keyframe);
-        await callControl({ short_keyframe: next ? '1' : '0' });
-      });
-
-      document.getElementById('enhanceBtn').addEventListener('click', async () => {
-        const next = !(stateStore.latest?.enhance);
-        await callControl({ enhance: next ? '1' : '0' });
-      });
-
-      document.getElementById('ditherBtn').addEventListener('click', async () => {
-        const next = !(stateStore.latest?.dither);
-        await callControl({ dither: next ? '1' : '0' });
-      });
-
-      document.getElementById('recordBtn').addEventListener('click', async () => {
-        const next = !(stateStore.latest?.recording);
-        await callControl({ recording: next ? '1' : '0' });
-      });
-    }
-
-    setupEvents();
-    pollState();
-    refreshFeeds();
-    setInterval(pollState, stateStore.refreshStateEveryMs);
-    setInterval(refreshFeeds, stateStore.refreshFramesEveryMs);
+    bind();
+    setTab('Link');
+    refreshState();
+    refreshFrames();
+    setInterval(refreshState, 500);
+    setInterval(refreshFrames, 160);
   </script>
 </body>
 </html>
@@ -1424,75 +1641,68 @@ bool parseResolutionString(const std::string &text, int &indexOut) {
 }
 
 void applyControlRequest(const httplib::Request &req, ControlState &control) {
-    std::lock_guard<std::mutex> lock(control.mutex);
-    const std::map<std::string, std::string> fallbackParams = queryMapFromTarget(req.target);
+    const std::map<std::string, std::string> params = requestParamMap(req);
 
-    auto getParam = [&](const char *name, std::string &valueOut) -> bool {
-        if (req.has_param(name)) {
-            valueOut = req.get_param_value(name);
-            return true;
+    auto itValue = [&](const char *name) -> std::optional<std::string> {
+        const auto it = params.find(name);
+        if (it == params.end()) {
+            return std::nullopt;
         }
-        const auto it = fallbackParams.find(name);
-        if (it != fallbackParams.end()) {
-            valueOut = it->second;
-            return true;
-        }
-        return false;
+        return it->second;
     };
 
-    std::string value;
+    std::lock_guard<std::mutex> lock(control.mutex);
 
-    if (getParam("mode", value)) {
-        const std::string mode = value;
-        if (mode == "safer") {
+    if (auto value = itValue("mode")) {
+        if (*value == "safer") {
             control.mode = CodecMode::Safer;
-        } else if (mode == "aggressive") {
+        } else if (*value == "aggressive") {
             control.mode = CodecMode::Aggressive;
         }
     }
 
-    if (getParam("target_fps", value)) {
+    if (auto value = itValue("target_fps")) {
         try {
-            const double fps = std::stod(value);
+            const double fps = std::stod(*value);
             control.targetFps = std::max(kMinTargetFps, fps);
         } catch (const std::exception &) {
         }
     }
 
-    if (getParam("resolution", value)) {
+    if (auto value = itValue("resolution")) {
         int idx = control.resolutionIndex;
-        if (parseResolutionString(value, idx)) {
+        if (parseResolutionString(*value, idx)) {
             control.resolutionIndex = idx;
         }
     }
 
-    if (getParam("resolution_index", value)) {
+    if (auto value = itValue("resolution_index")) {
         try {
-            const int idx = std::stoi(value);
+            const int idx = std::stoi(*value);
             control.resolutionIndex = std::clamp(idx, 0, static_cast<int>(kResolutionLevels.size()) - 1);
         } catch (const std::exception &) {
         }
     }
 
-    if (getParam("short_keyframe", value)) {
-        control.shortKeyframeInterval = boolFromParam(value, control.shortKeyframeInterval);
+    if (auto value = itValue("short_keyframe")) {
+        control.shortKeyframeInterval = boolFromParam(*value, control.shortKeyframeInterval);
     }
 
-    if (getParam("enhance", value)) {
-        control.useReceivedEnhancement = boolFromParam(value, control.useReceivedEnhancement);
+    if (auto value = itValue("enhance")) {
+        control.useReceivedEnhancement = boolFromParam(*value, control.useReceivedEnhancement);
     }
 
-    if (getParam("dither", value)) {
-        control.useReceivedDithering = boolFromParam(value, control.useReceivedDithering);
+    if (auto value = itValue("dither")) {
+        control.useReceivedDithering = boolFromParam(*value, control.useReceivedDithering);
     }
 
-    if (getParam("recording", value)) {
-        control.recordingEnabled = boolFromParam(value, control.recordingEnabled);
+    if (auto value = itValue("recording")) {
+        control.recordingEnabled = boolFromParam(*value, control.recordingEnabled);
     }
 
-    if (getParam("camera", value)) {
+    if (auto value = itValue("camera")) {
         try {
-            const int index = std::stoi(value);
+            const int index = std::stoi(*value);
             if (index >= 0 && index < 64) {
                 control.requestedCameraIndex = index;
             }
@@ -1500,68 +1710,125 @@ void applyControlRequest(const httplib::Request &req, ControlState &control) {
         }
     }
 
-    if (getParam("link_mode", value)) {
-        control.linkMode = parseLinkMode(value, control.linkMode);
+    if (auto value = itValue("link_role")) {
+        control.linkRole = parseLinkRole(*value, control.linkRole);
     }
 
-    if (getParam("rx_source", value)) {
-        control.rxSource = parseRxSource(value, control.rxSource);
+    if (auto value = itValue("rx_source")) {
+        control.rxSource = parseRxSource(*value, control.rxSource);
     }
 
-    if (getParam("session_mode", value)) {
-        control.sessionMode = parseSessionMode(value, control.sessionMode);
+    if (auto value = itValue("session_mode")) {
+        control.sessionMode = parseSessionMode(*value, control.sessionMode);
     }
 
-    if (getParam("band_mode", value)) {
-        control.bandMode = parseBandMode(value, control.bandMode);
+    if (auto value = itValue("band_mode")) {
+        control.bandMode = parseBandMode(*value, control.bandMode);
     }
 
-    if (getParam("audio_in_device", value)) {
+    if (auto value = itValue("audio_in_device")) {
         try {
-            control.requestedAudioInputDevice = std::stoi(value);
+            control.requestedAudioInputDevice = std::stoi(*value);
         } catch (const std::exception &) {
         }
     }
 
-    if (getParam("audio_out_device", value)) {
+    if (auto value = itValue("audio_out_device")) {
         try {
-            control.requestedAudioOutputDevice = std::stoi(value);
+            control.requestedAudioOutputDevice = std::stoi(*value);
         } catch (const std::exception &) {
         }
     }
 
-    if (getParam("media_path", value)) {
-        control.mediaPath = value;
+    if (auto value = itValue("media_path")) {
+        control.mediaPath = *value;
     }
 
-    if (getParam("force_keyframe", value)) {
-        if (boolFromParam(value, false)) {
+    if (auto value = itValue("transport_kind")) {
+        control.transportKind = parseTransportKind(*value, control.transportKind);
+    }
+
+    if (auto value = itValue("serial_port")) {
+        control.serialPort = *value;
+    }
+
+    if (auto value = itValue("serial_baud")) {
+        try {
+            control.serialBaud = std::clamp(std::stoi(*value), 1200, 1000000);
+        } catch (const std::exception &) {
+        }
+    }
+
+    if (auto value = itValue("node_alias")) {
+        control.nodeAlias = *value;
+    }
+
+    if (auto value = itValue("relay_export_path")) {
+        control.relayExportPath = *value;
+    }
+
+    if (auto value = itValue("relay_import_path")) {
+        control.relayImportPath = *value;
+    }
+
+    if (auto value = itValue("text_body")) {
+        control.outgoingText = *value;
+    }
+    if (auto value = itValue("text_scope")) {
+        control.outgoingTextScope = (*value == "direct") ? TargetScope::Direct : TargetScope::Broadcast;
+    }
+    if (auto value = itValue("text_target")) {
+        try {
+            control.outgoingTextTarget = static_cast<uint64_t>(std::stoull(*value));
+        } catch (const std::exception &) {
+        }
+    }
+    if (auto value = itValue("send_text")) {
+        if (boolFromParam(*value, false)) {
+            control.sendText = true;
+        }
+    }
+
+    if (auto value = itValue("force_keyframe")) {
+        if (boolFromParam(*value, false)) {
             control.forceNextKeyframe = true;
         }
     }
 
-    if (getParam("rescan_cameras", value)) {
-        if (boolFromParam(value, false)) {
+    if (auto value = itValue("rescan_cameras")) {
+        if (boolFromParam(*value, false)) {
             control.rescanCameras = true;
         }
     }
 
-    if (getParam("rescan_audio", value)) {
-        if (boolFromParam(value, false)) {
+    if (auto value = itValue("rescan_audio")) {
+        if (boolFromParam(*value, false)) {
             control.rescanAudio = true;
         }
     }
 
-    if (getParam("start_link", value)) {
-        if (boolFromParam(value, false)) {
+    if (auto value = itValue("export_relay")) {
+        if (boolFromParam(*value, false)) {
+            control.exportRelay = true;
+        }
+    }
+
+    if (auto value = itValue("import_relay")) {
+        if (boolFromParam(*value, false)) {
+            control.importRelay = true;
+        }
+    }
+
+    if (auto value = itValue("start_link")) {
+        if (boolFromParam(*value, false)) {
             control.startLink = true;
             control.stopLink = false;
             control.linkRunning = true;
         }
     }
 
-    if (getParam("stop_link", value)) {
-        if (boolFromParam(value, false)) {
+    if (auto value = itValue("stop_link")) {
+        if (boolFromParam(*value, false)) {
             control.stopLink = true;
             control.startLink = false;
             control.linkRunning = false;
@@ -1569,50 +1836,79 @@ void applyControlRequest(const httplib::Request &req, ControlState &control) {
     }
 }
 
-void copyControlSnapshot(ControlState &control,
-                         CodecMode &mode,
-                         int &resolutionIndex,
-                         double &targetFps,
-                         bool &shortKey,
-                         bool &enhance,
-                         bool &dither,
-                         bool &recording,
-                         int &camera,
-                         LinkMode &linkMode,
-                         RxSource &rxSource,
-                         SessionMode &sessionMode,
-                         BandMode &bandMode,
-                         int &audioInDevice,
-                         int &audioOutDevice,
-                         std::string &mediaPath,
-                         bool &linkRunning,
-                         bool &forceKey,
-                         bool &rescanCamera,
-                         bool &rescanAudio,
-                         bool &startLink,
-                         bool &stopLink) {
+struct ControlSnapshot {
+    CodecMode mode = CodecMode::Safer;
+    int resolutionIndex = 1;
+    double targetFps = 2.5;
+    bool shortKey = false;
+    bool enhance = true;
+    bool dither = false;
+    bool recording = false;
+    int camera = 0;
+    LinkRole linkRole = LinkRole::Duplex;
+    RxSource rxSource = RxSource::LiveMic;
+    SessionMode sessionMode = SessionMode::Broadcast;
+    BandMode bandMode = BandMode::Audible;
+    int audioInDevice = -1;
+    int audioOutDevice = -1;
+    std::string mediaPath;
+    TransportKind transportKind = TransportKind::Acoustic;
+    std::string serialPort;
+    int serialBaud = 115200;
+    std::string nodeAlias = "Field-Unit";
+    std::string relayExportPath = "./relay_out/export.evrelay";
+    std::string relayImportPath;
+    bool linkRunning = false;
+    bool forceKey = false;
+    bool rescanCamera = false;
+    bool rescanAudio = false;
+    bool startLink = false;
+    bool stopLink = false;
+    bool sendText = false;
+    std::string outgoingText;
+    TargetScope outgoingTextScope = TargetScope::Broadcast;
+    uint64_t outgoingTextTarget = 0;
+    bool exportRelay = false;
+    bool importRelay = false;
+};
+
+ControlSnapshot copyControlSnapshot(ControlState &control) {
+    ControlSnapshot out;
     std::lock_guard<std::mutex> lock(control.mutex);
-    mode = control.mode;
-    resolutionIndex = control.resolutionIndex;
-    targetFps = control.targetFps;
-    shortKey = control.shortKeyframeInterval;
-    enhance = control.useReceivedEnhancement;
-    dither = control.useReceivedDithering;
-    recording = control.recordingEnabled;
-    camera = control.requestedCameraIndex;
-    linkMode = control.linkMode;
-    rxSource = control.rxSource;
-    sessionMode = control.sessionMode;
-    bandMode = control.bandMode;
-    audioInDevice = control.requestedAudioInputDevice;
-    audioOutDevice = control.requestedAudioOutputDevice;
-    mediaPath = control.mediaPath;
-    linkRunning = control.linkRunning;
-    forceKey = control.forceNextKeyframe;
-    rescanCamera = control.rescanCameras;
-    rescanAudio = control.rescanAudio;
-    startLink = control.startLink;
-    stopLink = control.stopLink;
+    out.mode = control.mode;
+    out.resolutionIndex = control.resolutionIndex;
+    out.targetFps = control.targetFps;
+    out.shortKey = control.shortKeyframeInterval;
+    out.enhance = control.useReceivedEnhancement;
+    out.dither = control.useReceivedDithering;
+    out.recording = control.recordingEnabled;
+    out.camera = control.requestedCameraIndex;
+    out.linkRole = control.linkRole;
+    out.rxSource = control.rxSource;
+    out.sessionMode = control.sessionMode;
+    out.bandMode = control.bandMode;
+    out.audioInDevice = control.requestedAudioInputDevice;
+    out.audioOutDevice = control.requestedAudioOutputDevice;
+    out.mediaPath = control.mediaPath;
+    out.transportKind = control.transportKind;
+    out.serialPort = control.serialPort;
+    out.serialBaud = control.serialBaud;
+    out.nodeAlias = control.nodeAlias;
+    out.relayExportPath = control.relayExportPath;
+    out.relayImportPath = control.relayImportPath;
+    out.linkRunning = control.linkRunning;
+    out.forceKey = control.forceNextKeyframe;
+    out.rescanCamera = control.rescanCameras;
+    out.rescanAudio = control.rescanAudio;
+    out.startLink = control.startLink;
+    out.stopLink = control.stopLink;
+    out.sendText = control.sendText;
+    out.outgoingText = control.outgoingText;
+    out.outgoingTextScope = control.outgoingTextScope;
+    out.outgoingTextTarget = control.outgoingTextTarget;
+    out.exportRelay = control.exportRelay;
+    out.importRelay = control.importRelay;
+    return out;
 }
 
 void clearOneShotControlFlags(ControlState &control,
@@ -1620,7 +1916,10 @@ void clearOneShotControlFlags(ControlState &control,
                               bool clearRescanCamera,
                               bool clearRescanAudio,
                               bool clearStartLink,
-                              bool clearStopLink) {
+                              bool clearStopLink,
+                              bool clearSendText,
+                              bool clearExportRelay,
+                              bool clearImportRelay) {
     std::lock_guard<std::mutex> lock(control.mutex);
     if (clearForceKey) {
         control.forceNextKeyframe = false;
@@ -1637,12 +1936,147 @@ void clearOneShotControlFlags(ControlState &control,
     if (clearStopLink) {
         control.stopLink = false;
     }
+    if (clearSendText) {
+        control.sendText = false;
+        control.outgoingText.clear();
+    }
+    if (clearExportRelay) {
+        control.exportRelay = false;
+    }
+    if (clearImportRelay) {
+        control.importRelay = false;
+    }
 }
 
 void writeStateStatus(SharedState &shared, const std::string &status) {
     std::lock_guard<std::mutex> lock(shared.mutex);
     shared.status = status;
 }
+
+LinkMode acousticLinkModeFromRole(LinkRole role, RxSource rxSource) {
+    switch (role) {
+    case LinkRole::Send:
+        return LinkMode::AcousticTx;
+    case LinkRole::Receive:
+        return (rxSource == RxSource::MediaFile) ? LinkMode::AcousticRxMedia : LinkMode::AcousticRxLive;
+    case LinkRole::Duplex:
+        return LinkMode::AcousticDuplexArq;
+    }
+    return LinkMode::AcousticDuplexArq;
+}
+
+std::size_t transportFragmentBytes(TransportKind kind) {
+    switch (kind) {
+    case TransportKind::Acoustic:
+        return 96;
+    case TransportKind::Serial:
+        return 700;
+    case TransportKind::Optical:
+        return 40;
+    case TransportKind::FileRelay:
+        return 1300;
+    }
+    return 256;
+}
+
+bool isRelayablePayloadType(CommPayloadType type) {
+    return type == CommPayloadType::Text || type == CommPayloadType::Snapshot;
+}
+
+struct EnvelopeReassemblyEntry {
+    CommEnvelopeHeader header{};
+    std::vector<std::vector<uint8_t>> frags;
+    std::vector<uint8_t> present;
+    std::chrono::steady_clock::time_point lastSeen{};
+};
+
+class EnvelopeFragmentReassembler {
+public:
+    explicit EnvelopeFragmentReassembler(std::chrono::milliseconds timeout) : timeout_(timeout) {}
+
+    bool push(const CommEnvelopeHeader &header,
+              const std::vector<uint8_t> &payload,
+              std::vector<uint8_t> &completeEnvelope,
+              std::string &error) {
+        completeEnvelope.clear();
+        error.clear();
+        cleanupExpired();
+
+        if (header.fragCount <= 1) {
+            completeEnvelope = serializeCommEnvelope(header, payload);
+            return true;
+        }
+
+        if (header.fragIndex >= header.fragCount) {
+            error = "invalid fragment index";
+            return false;
+        }
+
+        const Key key{header.senderNodeId, header.msgId, header.seq};
+        auto &entry = entries_[key];
+        if (entry.frags.empty()) {
+            entry.header = header;
+            entry.frags.assign(header.fragCount, {});
+            entry.present.assign(header.fragCount, 0);
+        }
+        if (entry.frags.size() != header.fragCount) {
+            entries_.erase(key);
+            error = "fragment count mismatch";
+            return false;
+        }
+
+        entry.lastSeen = std::chrono::steady_clock::now();
+        const std::size_t idx = static_cast<std::size_t>(header.fragIndex);
+        entry.frags[idx] = payload;
+        entry.present[idx] = 1;
+
+        if (!std::all_of(entry.present.begin(), entry.present.end(), [](uint8_t v) { return v != 0; })) {
+            return false;
+        }
+
+        std::vector<uint8_t> assembled;
+        for (const auto &frag : entry.frags) {
+            assembled.insert(assembled.end(), frag.begin(), frag.end());
+        }
+
+        CommEnvelopeHeader merged = entry.header;
+        merged.fragIndex = 0;
+        merged.fragCount = 1;
+        completeEnvelope = serializeCommEnvelope(merged, assembled);
+        entries_.erase(key);
+        return true;
+    }
+
+private:
+    struct Key {
+        uint64_t sender = 0;
+        uint64_t msg = 0;
+        uint32_t seq = 0;
+        bool operator<(const Key &other) const {
+            if (sender != other.sender) {
+                return sender < other.sender;
+            }
+            if (msg != other.msg) {
+                return msg < other.msg;
+            }
+            return seq < other.seq;
+        }
+    };
+
+    void cleanupExpired() {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (now - it->second.lastSeen > timeout_) {
+                it = entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::chrono::milliseconds timeout_;
+    std::map<Key, EnvelopeReassemblyEntry> entries_;
+};
 
 } // namespace
 
@@ -1726,12 +2160,18 @@ int main() {
     int audioInputDevice = audioInputs.empty() ? -1 : audioInputs.front().index;
     int audioOutputDevice = audioOutputs.empty() ? -1 : audioOutputs.front().index;
 
-    LinkMode linkMode = LinkMode::LocalLoopback;
+    LinkRole linkRole = LinkRole::Duplex;
     RxSource rxSource = RxSource::LiveMic;
     SessionMode sessionMode = SessionMode::Broadcast;
     BandMode bandMode = BandMode::Audible;
     bool linkRunning = false;
     std::string mediaPath;
+    TransportKind transportKind = TransportKind::Acoustic;
+    std::string serialPort;
+    int serialBaud = 115200;
+    std::string nodeAlias = "Field-Unit";
+    std::string relayExportPath = "./relay_out/export.evrelay";
+    std::string relayImportPath;
 
     SessionConfig sessionConfig;
     sessionConfig.streamId = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1764,45 +2204,12 @@ int main() {
     sessionConfig.txSlotMs = 1100;
     sessionConfig.configHash = computeSessionConfigHash(sessionConfig);
 
-    auto modem = std::make_unique<MfskModem>(modemParamsFromSession(sessionConfig));
-    auto burstReceiver = std::make_unique<AcousticBurstReceiver>(*modem);
-    FragmentReassembler reassembler(std::chrono::milliseconds(4000));
     LinkStats linkStats;
-
-    struct PendingPacket {
-        uint32_t seq = 0;
-        std::vector<uint8_t> bytes;
-        std::chrono::steady_clock::time_point sentAt{};
-        int retransmits = 0;
-    };
-    struct TxCodecPayload {
-        std::vector<uint8_t> bytes;
-        uint8_t flags = 0;
-    };
-    std::map<uint32_t, PendingPacket> pendingArq;
-    std::deque<std::vector<uint8_t>> txRawFrameQueue;
-    std::deque<TxCodecPayload> pendingTxPayloads;
-    std::deque<AckPacket> pendingAcks;
-    std::deque<std::pair<AcousticFrameHeader, std::vector<uint8_t>>> pendingDataForUnknownConfig;
-    std::map<uint16_t, SessionConfig> knownRxConfigs;
-    std::map<uint16_t, std::unique_ptr<Decoder>> rxDecoders;
-    std::set<uint32_t> rxOutOfOrderSeq;
-    uint32_t remoteStreamId = 0;
-    uint32_t highestContiguousRxSeq = 0;
     uint64_t linkPayloadBytesReceived = 0;
-    uint64_t demodRecoveredSymbols = 0;
-    uint64_t demodTotalSymbols = 0;
     int startupConfigBurstRemaining = 0;
-    bool configBeaconForced = true;
-    uint32_t nextAcousticSeq = 1;
-    uint32_t highestAckedSeq = 0;
     auto lastConfigBeacon = std::chrono::steady_clock::now();
     auto linkStartTime = std::chrono::steady_clock::now();
     uint64_t linkPayloadBytesSent = 0;
-    std::string mediaLoadedPath;
-    std::vector<float> mediaPcm;
-    std::size_t mediaCursor = 0;
-    auto lastMediaFeedTime = std::chrono::steady_clock::now();
 
     ControlState control;
     {
@@ -1815,7 +2222,7 @@ int main() {
         control.shortKeyframeInterval = shortKeyframeInterval;
         control.recordingEnabled = recordingEnabled;
         control.requestedCameraIndex = cameraIndex;
-        control.linkMode = linkMode;
+        control.linkRole = linkRole;
         control.rxSource = rxSource;
         control.sessionMode = sessionMode;
         control.bandMode = bandMode;
@@ -1823,6 +2230,12 @@ int main() {
         control.requestedAudioOutputDevice = audioOutputDevice;
         control.linkRunning = linkRunning;
         control.mediaPath = mediaPath;
+        control.transportKind = transportKind;
+        control.serialPort = serialPort;
+        control.serialBaud = serialBaud;
+        control.nodeAlias = nodeAlias;
+        control.relayExportPath = relayExportPath;
+        control.relayImportPath = relayImportPath;
     }
 
     SharedState shared;
@@ -1845,7 +2258,7 @@ int main() {
         }
         shared.status = "running";
         shared.faceDetectorReady = faceDetectorReady;
-        shared.linkMode = linkMode;
+        shared.linkRole = linkRole;
         shared.rxSource = rxSource;
         shared.sessionMode = sessionMode;
         shared.bandMode = bandMode;
@@ -1859,6 +2272,12 @@ int main() {
         shared.streamId = sessionConfig.streamId;
         shared.configVersion = sessionConfig.configVersion;
         shared.configHash = sessionConfig.configHash;
+        shared.transportKind = transportKind;
+        shared.serialPort = serialPort;
+        shared.serialBaud = serialBaud;
+        shared.relayExportPath = relayExportPath;
+        shared.relayImportPath = relayImportPath;
+        shared.nodeAlias = nodeAlias;
     }
 
     const std::string indexHtml = makeIndexHtml();
@@ -1868,7 +2287,7 @@ int main() {
         res.set_content(indexHtml, "text/html; charset=utf-8");
     });
 
-    server.Get("/api/state", [&](const httplib::Request &, httplib::Response &res) {
+    server.Get("/api/v2/state", [&](const httplib::Request &, httplib::Response &res) {
         std::string payload;
         {
             std::lock_guard<std::mutex> lock(shared.mutex);
@@ -1878,8 +2297,46 @@ int main() {
         res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
     });
 
-    server.Get("/api/control", [&](const httplib::Request &req, httplib::Response &res) {
+    server.Post("/api/v2/control", [&](const httplib::Request &req, httplib::Response &res) {
         applyControlRequest(req, control);
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
+    server.Post("/api/v2/link/start", [&](const httplib::Request &, httplib::Response &res) {
+        std::lock_guard<std::mutex> lock(control.mutex);
+        control.startLink = true;
+        control.stopLink = false;
+        control.linkRunning = true;
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
+    server.Post("/api/v2/link/stop", [&](const httplib::Request &, httplib::Response &res) {
+        std::lock_guard<std::mutex> lock(control.mutex);
+        control.stopLink = true;
+        control.startLink = false;
+        control.linkRunning = false;
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
+    server.Post("/api/v2/messages/send", [&](const httplib::Request &req, httplib::Response &res) {
+        const std::map<std::string, std::string> params = requestParamMap(req);
+        std::lock_guard<std::mutex> lock(control.mutex);
+        auto itBody = params.find("body");
+        if (itBody != params.end()) {
+            control.outgoingText = itBody->second;
+            control.sendText = !control.outgoingText.empty();
+        }
+        auto itScope = params.find("scope");
+        if (itScope != params.end()) {
+            control.outgoingTextScope = (itScope->second == "direct") ? TargetScope::Direct : TargetScope::Broadcast;
+        }
+        auto itTarget = params.find("target_node_id");
+        if (itTarget != params.end()) {
+            try {
+                control.outgoingTextTarget = static_cast<uint64_t>(std::stoull(itTarget->second));
+            } catch (const std::exception &) {
+            }
+        }
         res.set_content("{\"ok\":true}", "application/json");
     });
 
@@ -1900,13 +2357,13 @@ int main() {
         res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
     };
 
-    server.Get("/api/frame/raw.jpg", [&](const httplib::Request &, httplib::Response &res) {
+    server.Get("/api/v2/frame/raw.jpg", [&](const httplib::Request &, httplib::Response &res) {
         serveFrame(&SharedState::rawJpeg, res);
     });
-    server.Get("/api/frame/sent.jpg", [&](const httplib::Request &, httplib::Response &res) {
+    server.Get("/api/v2/frame/sent.jpg", [&](const httplib::Request &, httplib::Response &res) {
         serveFrame(&SharedState::sentJpeg, res);
     });
-    server.Get("/api/frame/received.jpg", [&](const httplib::Request &, httplib::Response &res) {
+    server.Get("/api/v2/frame/received.jpg", [&](const httplib::Request &, httplib::Response &res) {
         serveFrame(&SharedState::receivedJpeg, res);
     });
 
@@ -1920,62 +2377,16 @@ int main() {
     using Clock = std::chrono::steady_clock;
     auto nextEncodeTime = Clock::now();
     auto lastConsolePrint = Clock::now();
-
     auto resetCodecPipeline = [&]() {
         encoder.setParams(params);
         decoder.reset();
         metrics.reset(params.width, params.height);
-        if (shortKeyframeInterval) {
-            encoder.setKeyframeInterval(activeKeyframeInterval(params, true));
-        }
+        encoder.setKeyframeInterval(activeKeyframeInterval(params, shortKeyframeInterval));
         haveSentFrame = false;
         interpolation = InterpolationState{};
         haveStats = false;
         nextEncodeTime = Clock::now();
     };
-
-    auto rebuildAcousticSession = [&](bool bumpVersion) {
-        if (bumpVersion) {
-            sessionConfig.configVersion = static_cast<uint16_t>(std::max<uint16_t>(1, sessionConfig.configVersion + 1));
-        }
-        sessionConfig.codecMode = params.mode;
-        sessionConfig.width = static_cast<uint16_t>(params.width);
-        sessionConfig.height = static_cast<uint16_t>(params.height);
-        sessionConfig.blockSize = static_cast<uint8_t>(params.blockSize);
-        sessionConfig.residualStep = static_cast<uint8_t>(std::max(1, params.residualStep));
-        sessionConfig.keyframeInterval = static_cast<uint8_t>(activeKeyframeInterval(params, shortKeyframeInterval));
-        sessionConfig.targetFps = static_cast<float>(params.targetFps);
-        sessionConfig.sessionMode = sessionMode;
-        sessionConfig.bandMode = bandMode;
-        sessionConfig.configHash = computeSessionConfigHash(sessionConfig);
-
-        modem = std::make_unique<MfskModem>(modemParamsFromSession(sessionConfig));
-        burstReceiver = std::make_unique<AcousticBurstReceiver>(*modem);
-        reassembler.clear();
-        pendingArq.clear();
-        pendingAcks.clear();
-        pendingDataForUnknownConfig.clear();
-        rxOutOfOrderSeq.clear();
-        txRawFrameQueue.clear();
-        pendingTxPayloads.clear();
-        remoteStreamId = 0;
-        highestContiguousRxSeq = 0;
-        nextAcousticSeq = 1;
-        highestAckedSeq = 0;
-        linkStats = LinkStats{};
-        linkPayloadBytesSent = 0;
-        linkPayloadBytesReceived = 0;
-        demodRecoveredSymbols = 0;
-        demodTotalSymbols = 0;
-        linkStartTime = Clock::now();
-        lastMediaFeedTime = Clock::now();
-        lastConfigBeacon = Clock::now() - std::chrono::seconds(5);
-        startupConfigBurstRemaining = 8;
-        configBeaconForced = true;
-        encoder.forceNextKeyframe();
-    };
-
-    int emptyFrames = 0;
 
     auto updateInterpolationFrame = [&](const Gray4Frame &decodedFrame, const Clock::time_point &ts) {
         if (!interpolation.hasCurrent) {
@@ -1997,271 +2408,164 @@ int main() {
         interpolation.blendStart = ts;
     };
 
-    auto enqueueAcousticPayload = [&](AcousticPayloadType payloadType,
-                                      uint32_t seq,
-                                      const std::vector<uint8_t> &payload,
-                                      uint8_t flags) {
-        std::vector<std::vector<uint8_t>> fragments;
-        if (payloadType == AcousticPayloadType::Data) {
-            fragments = fragmentPayload(payload, 220);
-        } else {
-            fragments = {payload};
-        }
+    TransportManager transportManager;
+    QueueStats queueStats{};
+    linkStats = LinkStats{};
+    linkPayloadBytesSent = 0;
+    linkPayloadBytesReceived = 0;
+    linkStartTime = Clock::now();
+    lastConfigBeacon = Clock::now() - std::chrono::seconds(5);
+    startupConfigBurstRemaining = 8;
+    bool forceConfigBurst = true;
+    int emptyFrames = 0;
 
-        const uint16_t fragCount = static_cast<uint16_t>(std::min<std::size_t>(fragments.size(), 0xFFFFU));
-        for (uint16_t frag = 0; frag < fragCount; ++frag) {
-            AcousticFrameHeader header;
-            header.payloadType = payloadType;
-            header.flags = flags;
-            header.streamId = sessionConfig.streamId;
-            header.sessionEpochMs = sessionConfig.sessionEpochMs;
-            header.configVersion = sessionConfig.configVersion;
-            header.configHash = sessionConfig.configHash;
-            header.seq = seq;
-            header.fragIndex = frag;
-            header.fragCount = std::max<uint16_t>(1, fragCount);
+    NodeIdentity nodeIdentity;
+    nodeIdentity.nodeId = (nowUnixMs() << 1U) ^ 0x5A17ULL;
+    nodeIdentity.alias = nodeAlias;
+    Router router(nodeIdentity);
 
-            txRawFrameQueue.push_back(
-                serializeAcousticFrame(header, fragments[static_cast<std::size_t>(frag)]));
-        }
+    PersistentStore store;
+    std::string storeError;
+    if (!store.init("./relay_store", storeError)) {
+        std::cerr << "Persistent store init failed: " << storeError << '\n';
+    }
 
-        constexpr std::size_t kMaxQueuedRawFrames = 512;
-        while (txRawFrameQueue.size() > kMaxQueuedRawFrames) {
-            txRawFrameQueue.pop_front();
+    SessionConfigV2 sessionConfigV2;
+    sessionConfigV2.streamId = sessionConfig.streamId;
+    sessionConfigV2.configVersion = sessionConfig.configVersion;
+
+    auto rebuildSessionConfig = [&](bool bumpVersion) {
+        if (bumpVersion) {
+            sessionConfig.configVersion = static_cast<uint16_t>(std::max<uint16_t>(1, sessionConfig.configVersion + 1));
+            sessionConfigV2.configVersion = static_cast<uint16_t>(std::max<uint16_t>(1, sessionConfigV2.configVersion + 1));
         }
+        sessionConfig.codecMode = params.mode;
+        sessionConfig.width = static_cast<uint16_t>(params.width);
+        sessionConfig.height = static_cast<uint16_t>(params.height);
+        sessionConfig.blockSize = static_cast<uint8_t>(params.blockSize);
+        sessionConfig.residualStep = static_cast<uint8_t>(std::max(1, params.residualStep));
+        sessionConfig.keyframeInterval = static_cast<uint8_t>(activeKeyframeInterval(params, shortKeyframeInterval));
+        sessionConfig.targetFps = static_cast<float>(params.targetFps);
+        sessionConfig.sessionMode = sessionMode;
+        sessionConfig.bandMode = bandMode;
+        sessionConfig.configHash = computeSessionConfigHash(sessionConfig);
+
+        sessionConfigV2.codecMode = params.mode;
+        sessionConfigV2.width = static_cast<uint16_t>(params.width);
+        sessionConfigV2.height = static_cast<uint16_t>(params.height);
+        sessionConfigV2.blockSize = static_cast<uint8_t>(params.blockSize);
+        sessionConfigV2.residualStep = static_cast<uint8_t>(std::max(1, params.residualStep));
+        sessionConfigV2.keyframeInterval = static_cast<uint8_t>(activeKeyframeInterval(params, shortKeyframeInterval));
+        sessionConfigV2.targetFps = static_cast<float>(params.targetFps);
+        sessionConfigV2.configHash = computeSessionConfigV2Hash(sessionConfigV2);
+    };
+    rebuildSessionConfig(false);
+
+    auto stopAllTransports = [&]() {
+        transportManager.acoustic().stop();
+        transportManager.serial().stop();
+        transportManager.optical().stop();
+        transportManager.fileRelay().stop();
     };
 
-    auto handleIncomingAck = [&](const AckPacket &ack) {
-        if (pendingArq.empty()) {
+    auto configureTransports = [&]() {
+        transportManager.setActive(transportKind);
+        transportManager.serial().setPreferredPort(serialPort);
+        transportManager.serial().setBaud(serialBaud);
+
+        const std::filesystem::path exportPath =
+            relayExportPath.empty() ? std::filesystem::path("./relay_out/export.evrelay") : std::filesystem::path(relayExportPath);
+        const std::filesystem::path importPath =
+            relayImportPath.empty() ? std::filesystem::path("./relay_in/import.evrelay") : std::filesystem::path(relayImportPath);
+        std::filesystem::path exportDir = exportPath.has_parent_path() ? exportPath.parent_path() : std::filesystem::path(".");
+        std::filesystem::path importDir = importPath.has_parent_path() ? importPath.parent_path() : std::filesystem::path(".");
+        if (exportDir.empty()) {
+            exportDir = ".";
+        }
+        if (importDir.empty()) {
+            importDir = ".";
+        }
+        transportManager.fileRelay().setDirectories(exportDir.string(), importDir.string());
+
+        const LinkMode acousticMode = acousticLinkModeFromRole(linkRole, rxSource);
+        transportManager.acoustic().configure(
+            sessionConfig, acousticMode, rxSource, sessionMode, audioInputDevice, audioOutputDevice, mediaPath);
+    };
+    configureTransports();
+
+    auto startActiveTransport = [&]() {
+        if (!linkRunning) {
             return;
         }
-
-        highestAckedSeq = std::max(highestAckedSeq, ack.ackSeq);
-        const auto now = Clock::now();
-
-        for (auto it = pendingArq.begin(); it != pendingArq.end();) {
-            if (it->first <= ack.ackSeq) {
-                const double rttMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
-                                         now - it->second.sentAt)
-                                         .count();
-                if (std::isfinite(rttMs) && rttMs > 0.0) {
-                    if (linkStats.rttMs <= 0.0) {
-                        linkStats.rttMs = rttMs;
-                    } else {
-                        linkStats.rttMs = linkStats.rttMs * 0.7 + rttMs * 0.3;
-                    }
-                }
-                it = pendingArq.erase(it);
-            } else {
-                ++it;
+        std::string error;
+        if (TransportAdapter *adapter = transportManager.activeAdapter()) {
+            if (!adapter->running() && !adapter->start(error)) {
+                writeStateStatus(shared, "transport start failed: " + error);
+                linkRunning = false;
+                std::lock_guard<std::mutex> lock(control.mutex);
+                control.linkRunning = false;
+                return;
             }
         }
-
-        for (uint32_t selective : ack.selectiveAcks) {
-            auto found = pendingArq.find(selective);
-            if (found == pendingArq.end()) {
-                continue;
-            }
-
-            const double rttMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
-                                     now - found->second.sentAt)
-                                     .count();
-            if (std::isfinite(rttMs) && rttMs > 0.0) {
-                if (linkStats.rttMs <= 0.0) {
-                    linkStats.rttMs = rttMs;
-                } else {
-                    linkStats.rttMs = linkStats.rttMs * 0.7 + rttMs * 0.3;
-                }
-            }
-
-            pendingArq.erase(found);
-        }
+        linkStartTime = Clock::now();
+        startupConfigBurstRemaining = 8;
+        forceConfigBurst = true;
     };
 
-    auto processReceivedDataPayload = [&](const AcousticFrameHeader &header,
-                                          const std::vector<uint8_t> &codecPayload,
-                                          const Clock::time_point &ts) {
-        if (sessionMode == SessionMode::DuplexArq && header.seq <= highestContiguousRxSeq) {
-            AckPacket ack;
-            ack.ackSeq = highestContiguousRxSeq;
-            ack.rttHintMs = static_cast<uint16_t>(std::clamp<double>(linkStats.rttMs, 0.0, 65000.0));
-            pendingAcks.push_back(std::move(ack));
-            return;
-        }
+    EnvelopeFragmentReassembler envelopeReassembler(std::chrono::milliseconds(4000));
+    std::map<uint64_t, std::unique_ptr<Decoder>> remoteDecoders;
 
-        const auto cfgIt = knownRxConfigs.find(header.configVersion);
-        if (cfgIt == knownRxConfigs.end() || cfgIt->second.configHash != header.configHash) {
-            if (pendingDataForUnknownConfig.size() >= 64) {
-                pendingDataForUnknownConfig.pop_front();
-            }
-            pendingDataForUnknownConfig.push_back({header, codecPayload});
-            return;
-        }
-
-        auto &decoderPtr = rxDecoders[header.configVersion];
-        if (!decoderPtr) {
-            decoderPtr = std::make_unique<Decoder>();
-            decoderPtr->reset();
-        }
-
-        DecodeResult decoded = decoderPtr->decode(codecPayload);
-        if (!decoded.ok) {
-            linkStats.framesDropped += 1;
-            return;
-        }
-
-        updateInterpolationFrame(decoded.frame, ts);
-        latestMeta = decoded.meta;
-        latestPacketBytes = codecPayload.size();
-        haveStats = true;
-        linkPayloadBytesReceived += codecPayload.size();
-
-        if (header.streamId != sessionConfig.streamId) {
-            remoteStreamId = header.streamId;
-        }
-
-        if (sessionMode == SessionMode::DuplexArq) {
-            if (header.seq == highestContiguousRxSeq + 1) {
-                highestContiguousRxSeq = header.seq;
-                while (rxOutOfOrderSeq.erase(highestContiguousRxSeq + 1) > 0) {
-                    ++highestContiguousRxSeq;
-                }
-            } else if (header.seq > highestContiguousRxSeq + 1) {
-                rxOutOfOrderSeq.insert(header.seq);
-            }
-
-            AckPacket ack;
-            ack.ackSeq = highestContiguousRxSeq;
-            ack.rttHintMs = static_cast<uint16_t>(std::clamp<double>(linkStats.rttMs, 0.0, 65000.0));
-            for (uint32_t seq : rxOutOfOrderSeq) {
-                ack.selectiveAcks.push_back(seq);
-                if (ack.selectiveAcks.size() >= 16) {
-                    break;
-                }
-            }
-            pendingAcks.push_back(std::move(ack));
-        }
-    };
-
-    auto processAcousticWireFrame = [&](const std::vector<uint8_t> &wireFrame, const Clock::time_point &ts) {
-        AcousticFrameHeader header;
+    auto processCompleteEnvelope = [&](const std::vector<uint8_t> &envelope, const Clock::time_point &now) {
+        CommEnvelopeHeader header;
         std::vector<uint8_t> payload;
         std::string error;
-        if (!deserializeAcousticFrame(wireFrame, header, payload, error)) {
+        if (!deserializeCommEnvelope(envelope, header, payload, error)) {
             linkStats.framesDropped += 1;
             return;
         }
 
+        linkPayloadBytesReceived += payload.size();
         linkStats.framesReceived += 1;
         linkStats.syncLocked = true;
 
-        if (header.streamId == sessionConfig.streamId &&
-            (linkMode == LinkMode::AcousticTx || linkMode == LinkMode::AcousticDuplexArq)) {
-            // Ignore self-looped speaker->mic feedback in local TX roles.
-            return;
-        }
+        std::string persistError;
+        (void)store.persistInbound(header, payload, isRelayablePayloadType(header.payloadType), persistError);
 
-        if (header.payloadType == AcousticPayloadType::Config) {
-            SessionConfig incoming;
-            if (!deserializeSessionConfig(payload, incoming, error)) {
+        RouterEvents events = router.processIncomingEnvelope(envelope, now);
+        for (const auto &video : events.videoFrames) {
+            auto &decoderPtr = remoteDecoders[video.header.senderNodeId];
+            if (!decoderPtr) {
+                decoderPtr = std::make_unique<Decoder>();
+                decoderPtr->reset();
+            }
+            DecodeResult decoded = decoderPtr->decode(video.codecPayload);
+            if (!decoded.ok) {
                 linkStats.framesDropped += 1;
-                return;
+                continue;
             }
-
-            knownRxConfigs[incoming.configVersion] = incoming;
-            auto decoderPtr = std::make_unique<Decoder>();
-            decoderPtr->reset();
-            rxDecoders[incoming.configVersion] = std::move(decoderPtr);
-
-            if (knownRxConfigs.size() > 8) {
-                knownRxConfigs.erase(knownRxConfigs.begin());
-            }
-            while (rxDecoders.size() > 8) {
-                rxDecoders.erase(rxDecoders.begin());
-            }
-
-            remoteStreamId = incoming.streamId;
-            linkStats.syncLocked = true;
-
-            for (auto it = pendingDataForUnknownConfig.begin(); it != pendingDataForUnknownConfig.end();) {
-                if (it->first.configVersion == incoming.configVersion && it->first.configHash == incoming.configHash) {
-                    processReceivedDataPayload(it->first, it->second, ts);
-                    it = pendingDataForUnknownConfig.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-
-            return;
+            updateInterpolationFrame(decoded.frame, now);
+            latestMeta = decoded.meta;
+            latestPacketBytes = video.codecPayload.size();
+            haveStats = true;
         }
-
-        if (header.payloadType == AcousticPayloadType::Ack) {
-            AckPacket ack;
-            if (!deserializeAckPacket(payload, ack, error)) {
-                linkStats.framesDropped += 1;
-                return;
-            }
-            handleIncomingAck(ack);
-            return;
+        for (const auto &snapshot : events.snapshots) {
+            (void)snapshot;
         }
-
-        reassembler.push(header, payload);
-        uint32_t seq = 0;
-        std::vector<uint8_t> assembled;
-        while (reassembler.popComplete(seq, assembled)) {
-            AcousticFrameHeader completeHeader = header;
-            completeHeader.seq = seq;
-            processReceivedDataPayload(completeHeader, assembled, ts);
+        for (const auto &text : events.texts) {
+            (void)text;
         }
     };
 
+    if (linkRunning) {
+        startActiveTransport();
+    }
+
     while (!gStop.load()) {
-        CodecMode desiredMode = mode;
-        int desiredResolutionIndex = resolutionIndex;
-        double desiredFps = targetFps;
-        bool desiredShortKey = shortKeyframeInterval;
-        bool desiredEnhance = useReceivedEnhancement;
-        bool desiredDither = useReceivedDithering;
-        bool desiredRecording = recordingEnabled;
-        int desiredCameraIndex = cameraIndex;
-        LinkMode desiredLinkMode = linkMode;
-        RxSource desiredRxSource = rxSource;
-        SessionMode desiredSessionMode = sessionMode;
-        BandMode desiredBandMode = bandMode;
-        int desiredAudioInputDevice = audioInputDevice;
-        int desiredAudioOutputDevice = audioOutputDevice;
-        std::string desiredMediaPath = mediaPath;
-        bool desiredLinkRunning = linkRunning;
-        bool requestForceKey = false;
-        bool requestRescanCamera = false;
-        bool requestRescanAudio = false;
-        bool requestStartLink = false;
-        bool requestStopLink = false;
+        const ControlSnapshot desired = copyControlSnapshot(control);
+        bool transportNeedsReconfigure = false;
+        bool bumpConfigVersion = false;
 
-        copyControlSnapshot(control,
-                            desiredMode,
-                            desiredResolutionIndex,
-                            desiredFps,
-                            desiredShortKey,
-                            desiredEnhance,
-                            desiredDither,
-                            desiredRecording,
-                            desiredCameraIndex,
-                            desiredLinkMode,
-                            desiredRxSource,
-                            desiredSessionMode,
-                            desiredBandMode,
-                            desiredAudioInputDevice,
-                            desiredAudioOutputDevice,
-                            desiredMediaPath,
-                            desiredLinkRunning,
-                            requestForceKey,
-                            requestRescanCamera,
-                            requestRescanAudio,
-                            requestStartLink,
-                            requestStopLink);
-
-        if (requestRescanCamera) {
+        if (desired.rescanCamera) {
             const std::vector<int> cameras = probeAvailableCameraIndices(kMaxCameraProbe);
             {
                 std::lock_guard<std::mutex> lock(shared.mutex);
@@ -2273,10 +2577,9 @@ int main() {
                 }
                 shared.status = "camera list refreshed";
             }
-            clearOneShotControlFlags(control, false, true, false, false, false);
+            clearOneShotControlFlags(control, false, true, false, false, false, false, false, false);
         }
-
-        if (requestRescanAudio) {
+        if (desired.rescanAudio) {
             audioInputs = audioEngine.listInputDevices();
             audioOutputs = audioEngine.listOutputDevices();
             {
@@ -2285,160 +2588,47 @@ int main() {
                 shared.audioOutputs = audioOutputs;
                 shared.status = "audio list refreshed";
             }
-            clearOneShotControlFlags(control, false, false, true, false, false);
+            clearOneShotControlFlags(control, false, false, true, false, false, false, false, false);
         }
-
-        if (requestForceKey) {
+        if (desired.forceKey) {
             encoder.forceNextKeyframe();
-            clearOneShotControlFlags(control, true, false, false, false, false);
+            clearOneShotControlFlags(control, true, false, false, false, false, false, false, false);
         }
 
-        desiredResolutionIndex = std::clamp(desiredResolutionIndex, 0, static_cast<int>(kResolutionLevels.size()) - 1);
-        desiredFps = std::max(kMinTargetFps, desiredFps);
+        const int desiredResolutionIndex =
+            std::clamp(desired.resolutionIndex, 0, static_cast<int>(kResolutionLevels.size()) - 1);
+        const double desiredFps = std::max(kMinTargetFps, desired.targetFps);
 
-        if (desiredCameraIndex != cameraIndex) {
-            if (switchCamera(camera, desiredCameraIndex)) {
-                cameraIndex = desiredCameraIndex;
+        if (desired.camera != cameraIndex) {
+            if (switchCamera(camera, desired.camera)) {
+                cameraIndex = desired.camera;
                 emptyFrames = 0;
                 writeStateStatus(shared, "camera switched to index " + std::to_string(cameraIndex));
-                std::cout << "Camera switched to index " << cameraIndex << '\n';
             } else {
-                writeStateStatus(shared, "camera switch failed for index " + std::to_string(desiredCameraIndex));
+                writeStateStatus(shared, "camera switch failed for index " + std::to_string(desired.camera));
             }
         }
 
-        if (desiredMode != mode || desiredResolutionIndex != resolutionIndex) {
-            mode = desiredMode;
+        if (desired.mode != mode || desiredResolutionIndex != resolutionIndex || std::abs(desiredFps - targetFps) > 1e-6) {
+            mode = desired.mode;
             resolutionIndex = desiredResolutionIndex;
-            params = makeRuntimeParams(mode, resolutionIndex, desiredFps);
             targetFps = desiredFps;
-            shortKeyframeInterval = desiredShortKey;
+            params = makeRuntimeParams(mode, resolutionIndex, targetFps);
             resetCodecPipeline();
-            rebuildAcousticSession(true);
-            writeStateStatus(shared, "codec profile updated");
-        } else if (std::abs(desiredFps - targetFps) > 1e-6) {
-            targetFps = desiredFps;
-            params.targetFps = targetFps;
-            rebuildAcousticSession(true);
-            nextEncodeTime = Clock::now();
+            bumpConfigVersion = true;
         }
 
-        if (desiredShortKey != shortKeyframeInterval) {
-            shortKeyframeInterval = desiredShortKey;
+        if (desired.shortKey != shortKeyframeInterval) {
+            shortKeyframeInterval = desired.shortKey;
             encoder.setKeyframeInterval(activeKeyframeInterval(params, shortKeyframeInterval));
-            writeStateStatus(shared,
-                             std::string("keyframe interval switched to ") +
-                                 std::to_string(activeKeyframeInterval(params, shortKeyframeInterval)));
-            rebuildAcousticSession(true);
+            bumpConfigVersion = true;
         }
 
-        useReceivedEnhancement = desiredEnhance;
-        useReceivedDithering = desiredDither;
+        useReceivedEnhancement = desired.enhance;
+        useReceivedDithering = desired.dither;
 
-        const bool previousLinkRunning = linkRunning;
-        bool acousticConfigChanged = false;
-        if (desiredLinkMode != linkMode) {
-            linkMode = desiredLinkMode;
-            acousticConfigChanged = true;
-        }
-        if (desiredRxSource != rxSource) {
-            rxSource = desiredRxSource;
-            acousticConfigChanged = true;
-        }
-        if (desiredSessionMode != sessionMode) {
-            sessionMode = desiredSessionMode;
-            acousticConfigChanged = true;
-        }
-        if (desiredBandMode != bandMode) {
-            bandMode = desiredBandMode;
-            acousticConfigChanged = true;
-        }
-        if (desiredAudioInputDevice != audioInputDevice) {
-            audioInputDevice = desiredAudioInputDevice;
-            acousticConfigChanged = true;
-        }
-        if (desiredAudioOutputDevice != audioOutputDevice) {
-            audioOutputDevice = desiredAudioOutputDevice;
-            acousticConfigChanged = true;
-        }
-        if (desiredMediaPath != mediaPath) {
-            mediaPath = desiredMediaPath;
-            acousticConfigChanged = true;
-            mediaLoadedPath.clear();
-            mediaPcm.clear();
-            mediaCursor = 0;
-        }
-        if (desiredLinkRunning != linkRunning) {
-            linkRunning = desiredLinkRunning;
-        }
-        if (requestStartLink) {
-            linkRunning = true;
-            clearOneShotControlFlags(control, false, false, false, true, false);
-        }
-        if (requestStopLink) {
-            linkRunning = false;
-            clearOneShotControlFlags(control, false, false, false, false, true);
-        }
-
-        if (acousticConfigChanged) {
-            rebuildAcousticSession(true);
-        }
-
-        if (!previousLinkRunning && linkRunning) {
-            startupConfigBurstRemaining = 8;
-            configBeaconForced = true;
-            linkStartTime = Clock::now();
-            lastConfigBeacon = Clock::now() - std::chrono::seconds(5);
-            txRawFrameQueue.clear();
-            pendingTxPayloads.clear();
-            pendingArq.clear();
-            pendingAcks.clear();
-            audioEngine.clearCaptureBuffer();
-            audioEngine.clearPlaybackBuffer();
-        } else if (previousLinkRunning && !linkRunning) {
-            txRawFrameQueue.clear();
-            pendingTxPayloads.clear();
-            pendingArq.clear();
-            pendingAcks.clear();
-            reassembler.clear();
-            audioEngine.clearCaptureBuffer();
-            audioEngine.clearPlaybackBuffer();
-            linkStats.syncLocked = false;
-        }
-
-        const bool captureNeeded = linkRunning &&
-                                   ((linkMode == LinkMode::AcousticRxLive && rxSource == RxSource::LiveMic) ||
-                                    linkMode == LinkMode::AcousticDuplexArq ||
-                                    (linkMode == LinkMode::AcousticTx && sessionMode == SessionMode::DuplexArq));
-        const bool playbackNeeded = linkRunning &&
-                                    (linkMode == LinkMode::AcousticTx || linkMode == LinkMode::AcousticDuplexArq ||
-                                     ((linkMode == LinkMode::AcousticRxLive || linkMode == LinkMode::AcousticRxMedia) &&
-                                      sessionMode == SessionMode::DuplexArq));
-
-        if (captureNeeded && !audioEngine.captureRunning()) {
-            if (!audioEngine.startCapture(audioInputDevice, sessionConfig.sampleRate)) {
-                writeStateStatus(shared, "failed to start audio capture");
-            } else {
-                audioEngine.clearCaptureBuffer();
-            }
-        } else if (!captureNeeded && audioEngine.captureRunning()) {
-            audioEngine.stopCapture();
-            audioEngine.clearCaptureBuffer();
-        }
-
-        if (playbackNeeded && !audioEngine.playbackRunning()) {
-            if (!audioEngine.startPlayback(audioOutputDevice, sessionConfig.sampleRate)) {
-                writeStateStatus(shared, "failed to start audio playback");
-            } else {
-                audioEngine.clearPlaybackBuffer();
-            }
-        } else if (!playbackNeeded && audioEngine.playbackRunning()) {
-            audioEngine.stopPlayback();
-            audioEngine.clearPlaybackBuffer();
-        }
-
-        if (desiredRecording != recordingEnabled) {
-            if (desiredRecording) {
+        if (desired.recording != recordingEnabled) {
+            if (desired.recording) {
                 lastRecordingPath = makeRecordingFileName();
                 if (!openRecordingFile(recordingFile, lastRecordingPath)) {
                     writeStateStatus(shared, "recording start failed");
@@ -2453,6 +2643,124 @@ int main() {
                 }
                 writeStateStatus(shared, "recording stopped");
             }
+        }
+
+        if (desired.linkRole != linkRole) {
+            linkRole = desired.linkRole;
+            transportNeedsReconfigure = true;
+        }
+        if (desired.rxSource != rxSource) {
+            rxSource = desired.rxSource;
+            transportNeedsReconfigure = true;
+        }
+        if (desired.sessionMode != sessionMode) {
+            sessionMode = desired.sessionMode;
+            transportNeedsReconfigure = true;
+            bumpConfigVersion = true;
+        }
+        if (desired.bandMode != bandMode) {
+            bandMode = desired.bandMode;
+            transportNeedsReconfigure = true;
+            bumpConfigVersion = true;
+        }
+        if (desired.audioInDevice != audioInputDevice) {
+            audioInputDevice = desired.audioInDevice;
+            transportNeedsReconfigure = true;
+        }
+        if (desired.audioOutDevice != audioOutputDevice) {
+            audioOutputDevice = desired.audioOutDevice;
+            transportNeedsReconfigure = true;
+        }
+        if (desired.mediaPath != mediaPath) {
+            mediaPath = desired.mediaPath;
+            transportNeedsReconfigure = true;
+        }
+        if (desired.transportKind != transportKind) {
+            transportKind = desired.transportKind;
+            transportNeedsReconfigure = true;
+        }
+        if (desired.serialPort != serialPort || desired.serialBaud != serialBaud) {
+            serialPort = desired.serialPort;
+            serialBaud = desired.serialBaud;
+            transportNeedsReconfigure = true;
+        }
+        if (desired.nodeAlias != nodeAlias) {
+            nodeAlias = desired.nodeAlias;
+            nodeIdentity.alias = nodeAlias;
+            bumpConfigVersion = true;
+        }
+        if (desired.relayExportPath != relayExportPath || desired.relayImportPath != relayImportPath) {
+            relayExportPath = desired.relayExportPath;
+            relayImportPath = desired.relayImportPath;
+            transportNeedsReconfigure = true;
+        }
+
+        if (desired.startLink) {
+            linkRunning = true;
+            clearOneShotControlFlags(control, false, false, false, true, false, false, false, false);
+        }
+        if (desired.stopLink) {
+            linkRunning = false;
+            clearOneShotControlFlags(control, false, false, false, false, true, false, false, false);
+        }
+        if (desired.linkRunning != linkRunning && !desired.startLink && !desired.stopLink) {
+            linkRunning = desired.linkRunning;
+        }
+
+        if (desired.sendText) {
+            if (!desired.outgoingText.empty()) {
+                router.enqueueText(desired.outgoingText, desired.outgoingTextScope, desired.outgoingTextTarget);
+            }
+            clearOneShotControlFlags(control, false, false, false, false, false, true, false, false);
+        }
+
+        if (desired.exportRelay) {
+            std::size_t exportedCount = 0;
+            std::string error;
+            if (!store.exportRelayBundle(relayExportPath, 2048, &exportedCount, error)) {
+                writeStateStatus(shared, "relay export failed: " + error);
+            } else {
+                writeStateStatus(shared, "relay export complete (" + std::to_string(exportedCount) + " records)");
+            }
+            clearOneShotControlFlags(control, false, false, false, false, false, false, true, false);
+        }
+        if (desired.importRelay) {
+            std::vector<std::vector<uint8_t>> imported;
+            std::string error;
+            if (!store.importRelayBundle(relayImportPath, imported, error)) {
+                writeStateStatus(shared, "relay import failed: " + error);
+            } else {
+                const auto now = Clock::now();
+                for (const auto &env : imported) {
+                    processCompleteEnvelope(env, now);
+                }
+                writeStateStatus(shared, "relay import complete (" + std::to_string(imported.size()) + " envelopes)");
+            }
+            clearOneShotControlFlags(control, false, false, false, false, false, false, false, true);
+        }
+
+        if (bumpConfigVersion) {
+            rebuildSessionConfig(true);
+            forceConfigBurst = true;
+            startupConfigBurstRemaining = 8;
+            encoder.forceNextKeyframe();
+        }
+
+        if (transportNeedsReconfigure) {
+            const bool wasRunning = linkRunning;
+            stopAllTransports();
+            configureTransports();
+            if (wasRunning) {
+                startActiveTransport();
+            }
+            forceConfigBurst = true;
+        }
+
+        if (linkRunning) {
+            startActiveTransport();
+        } else {
+            stopAllTransports();
+            linkStats.syncLocked = false;
         }
 
         cv::Mat bgr;
@@ -2473,23 +2781,8 @@ int main() {
         emptyFrames = 0;
 
         const auto now = Clock::now();
-        const bool txVideoEnabled = (linkMode == LinkMode::LocalLoopback || linkMode == LinkMode::AcousticTx ||
-                                     linkMode == LinkMode::AcousticDuplexArq);
-        const bool rxPathEnabled =
-            linkRunning &&
-            (linkMode == LinkMode::AcousticRxLive || linkMode == LinkMode::AcousticRxMedia ||
-             linkMode == LinkMode::AcousticDuplexArq ||
-             (linkMode == LinkMode::AcousticTx && sessionMode == SessionMode::DuplexArq));
-        const bool txControlEnabled =
-            linkRunning &&
-            (linkMode == LinkMode::AcousticTx || linkMode == LinkMode::AcousticDuplexArq ||
-             ((linkMode == LinkMode::AcousticRxLive || linkMode == LinkMode::AcousticRxMedia) &&
-              sessionMode == SessionMode::DuplexArq));
-
-        const bool senderRole =
-            (remoteStreamId == 0) ? ((sessionConfig.streamId & 1U) == 0U) : (sessionConfig.streamId < remoteStreamId);
-        const bool txSlot =
-            sessionMode == SessionMode::DuplexArq ? isTxSlotNow(sessionConfig, now, senderRole) : true;
+        const bool roleSend = linkRole != LinkRole::Receive;
+        const bool roleReceive = linkRole != LinkRole::Send;
 
         if (now >= nextEncodeTime) {
             const cv::Mat grayCodec = resizeAndGrayscale(bgr, params.width, params.height);
@@ -2507,224 +2800,139 @@ int main() {
                 lastFacesRaw.clear();
             }
 
-            if (txVideoEnabled) {
-                EncodedPacket packet;
-                try {
-                    packet = encoder.encode(inputFrame, roiBlocks.empty() ? nullptr : &roiBlocks);
-                } catch (const std::exception &ex) {
-                    writeStateStatus(shared, std::string("encode failure: ") + ex.what());
-                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-                    continue;
+            EncodedPacket packet;
+            try {
+                packet = encoder.encode(inputFrame, roiBlocks.empty() ? nullptr : &roiBlocks);
+            } catch (const std::exception &ex) {
+                writeStateStatus(shared, std::string("encode failure: ") + ex.what());
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+
+            if (recordingEnabled && !appendRecordingPacket(recordingFile, packet.bytes)) {
+                writeStateStatus(shared, "recording write failed; recording disabled");
+                recordingEnabled = false;
+                if (recordingFile.is_open()) {
+                    recordingFile.close();
                 }
-                const std::size_t packetBytes = packet.bytes.size();
+                std::lock_guard<std::mutex> lock(control.mutex);
+                control.recordingEnabled = false;
+            }
 
-                if (recordingEnabled) {
-                    if (!appendRecordingPacket(recordingFile, packet.bytes)) {
-                        writeStateStatus(shared, "recording write failed; recording disabled");
-                        recordingEnabled = false;
-                        recordingFile.close();
-                        {
-                            std::lock_guard<std::mutex> lock(control.mutex);
-                            control.recordingEnabled = false;
-                        }
-                    }
-                }
-
-                DecodeResult localPreview = decoder.decode(packet.bytes);
-                if (!localPreview.ok) {
-                    writeStateStatus(shared, std::string("decode failure: ") + localPreview.error);
-                    if (linkMode == LinkMode::LocalLoopback) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(40));
-                        continue;
-                    }
-                } else {
-                    metrics.update(packet.meta, packetBytes, inputFrame, localPreview.frame);
-                    latestMetrics = metrics.snapshot();
-                    latestMeta = packet.meta;
-                    latestPacketBytes = packetBytes;
-                    haveStats = true;
-
-                    if (linkMode == LinkMode::LocalLoopback || linkMode == LinkMode::AcousticTx || remoteStreamId == 0) {
-                        updateInterpolationFrame(localPreview.frame, now);
-                    }
-                }
-
-                if (linkRunning && (linkMode == LinkMode::AcousticTx || linkMode == LinkMode::AcousticDuplexArq)) {
-                    TxCodecPayload txPayload;
-                    txPayload.bytes = std::move(packet.bytes);
-                    txPayload.flags =
-                        (packet.meta.frameType == FrameType::Keyframe) ? static_cast<uint8_t>(0x1U) : static_cast<uint8_t>(0U);
-                    pendingTxPayloads.push_back(std::move(txPayload));
-                    while (pendingTxPayloads.size() > 32) {
-                        pendingTxPayloads.pop_front();
-                    }
-                }
-
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastConsolePrint).count() >= 1) {
-                    std::cout << "mode=" << codecModeName(params.mode) << " cam=" << cameraIndex
-                              << " frame=" << packet.meta.frameIndex << " bytes=" << packetBytes
-                              << " live=" << formatDouble(latestMetrics.liveBitrateKbps)
-                              << "kbps smooth=" << formatDouble(latestMetrics.smoothedBitrateKbps)
-                              << "kbps avg=" << formatDouble(latestMetrics.averageBitrateKbps)
-                              << "kbps faces=" << lastFacesRaw.size()
-                              << " txq=" << pendingTxPayloads.size() << " arq=" << pendingArq.size() << '\n';
-                    lastConsolePrint = now;
+            DecodeResult localPreview = decoder.decode(packet.bytes);
+            if (localPreview.ok) {
+                metrics.update(packet.meta, packet.bytes.size(), inputFrame, localPreview.frame);
+                latestMetrics = metrics.snapshot();
+                latestMeta = packet.meta;
+                latestPacketBytes = packet.bytes.size();
+                haveStats = true;
+                if (!roleReceive || !linkRunning) {
+                    updateInterpolationFrame(localPreview.frame, now);
                 }
             }
 
-            const int encodePeriodMs =
-                std::max(1, static_cast<int>(std::lround(1000.0 / std::max(0.1, params.targetFps))));
+            if (linkRunning && roleSend) {
+                router.enqueueVideoFrame(packet.bytes, packet.meta.frameType == FrameType::Keyframe);
+            }
+
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastConsolePrint).count() >= 1) {
+                std::cout << "mode=" << codecModeName(params.mode) << " cam=" << cameraIndex
+                          << " bytes=" << packet.bytes.size()
+                          << " live=" << formatDouble(latestMetrics.liveBitrateKbps) << "kbps"
+                          << " transport=" << transportKindName(transportKind)
+                          << " role=" << linkRoleName(linkRole) << '\n';
+                lastConsolePrint = now;
+            }
+
+            const int encodePeriodMs = std::max(1, static_cast<int>(std::lround(1000.0 / std::max(0.1, params.targetFps))));
             nextEncodeTime = now + std::chrono::milliseconds(encodePeriodMs);
         }
 
-        if (linkRunning &&
-            (linkMode == LinkMode::AcousticRxMedia ||
-             (linkMode == LinkMode::AcousticRxLive && rxSource == RxSource::MediaFile))) {
-            if (mediaPath.empty()) {
-                writeStateStatus(shared, "set media path for acoustic_rx_media");
-            } else if (mediaLoadedPath != mediaPath) {
-                std::string ffmpegError;
-                std::vector<float> decodedPcm;
-                if (!decodeMediaAudioToMonoF32(mediaPath, sessionConfig.sampleRate, decodedPcm, ffmpegError)) {
-                    writeStateStatus(shared, std::string("media decode failed: ") + ffmpegError);
-                    mediaLoadedPath.clear();
-                    mediaPcm.clear();
-                    mediaCursor = 0;
-                } else {
-                    mediaLoadedPath = mediaPath;
-                    mediaPcm = std::move(decodedPcm);
-                    mediaCursor = 0;
-                    burstReceiver->clear();
-                    lastMediaFeedTime = now;
-                    writeStateStatus(shared, "media loaded for acoustic RX");
+        if (linkRunning) {
+            TransportAdapter *adapter = transportManager.activeAdapter();
+            if (adapter != nullptr && adapter->running()) {
+                if (transportKind == TransportKind::Optical && roleReceive) {
+                    transportManager.optical().feedRxFrame(bgr);
                 }
-            }
 
-            if (!mediaPcm.empty()) {
-                const auto feedStep = std::chrono::milliseconds(35);
-                while (lastMediaFeedTime + feedStep <= now) {
-                    const std::size_t feedCount = std::max<std::size_t>(
-                        64, static_cast<std::size_t>((sessionConfig.sampleRate * feedStep.count()) / 1000));
-                    std::vector<float> chunk;
-                    chunk.reserve(feedCount);
-                    for (std::size_t i = 0; i < feedCount; ++i) {
-                        if (mediaCursor >= mediaPcm.size()) {
-                            mediaCursor = 0;
+                if (roleReceive) {
+                    std::vector<std::vector<uint8_t>> incoming;
+                    adapter->pollIncoming(incoming);
+                    for (const auto &wire : incoming) {
+                        CommEnvelopeHeader header;
+                        std::vector<uint8_t> payload;
+                        std::string error;
+                        if (!deserializeCommEnvelope(wire, header, payload, error)) {
+                            linkStats.framesDropped += 1;
+                            continue;
                         }
-                        chunk.push_back(mediaPcm[mediaCursor++]);
+                        std::vector<uint8_t> completeEnvelope;
+                        if (!envelopeReassembler.push(header, payload, completeEnvelope, error)) {
+                            if (!error.empty()) {
+                                linkStats.framesDropped += 1;
+                            }
+                            continue;
+                        }
+                        processCompleteEnvelope(completeEnvelope, now);
                     }
-                    burstReceiver->feedSamples(chunk.data(), chunk.size());
-                    lastMediaFeedTime += feedStep;
-                }
-            }
-        }
-
-        if (audioEngine.captureRunning() && rxPathEnabled) {
-            std::vector<float> captured;
-            audioEngine.popCaptured(captured, static_cast<std::size_t>(sessionConfig.sampleRate / 4U));
-            if (!captured.empty()) {
-                burstReceiver->feedSamples(captured.data(), captured.size());
-            }
-        }
-
-        while (true) {
-            std::vector<uint8_t> rawFrame;
-            std::size_t recoveredSymbols = 0;
-            if (!burstReceiver->popFrame(rawFrame, &recoveredSymbols)) {
-                break;
-            }
-            linkStats.fecRecoveredCount += recoveredSymbols;
-            demodRecoveredSymbols += recoveredSymbols;
-            demodTotalSymbols += rawFrame.size() * 8U;
-            processAcousticWireFrame(rawFrame, now);
-        }
-
-        if (txControlEnabled && txSlot) {
-            const bool periodicBeacon =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - lastConfigBeacon).count() >= 2500;
-            if (startupConfigBurstRemaining > 0 || configBeaconForced || periodicBeacon) {
-                const std::vector<uint8_t> cfgBytes = serializeSessionConfig(sessionConfig);
-                enqueueAcousticPayload(AcousticPayloadType::Config, nextAcousticSeq++, cfgBytes, 0x1U);
-                lastConfigBeacon = now;
-                if (startupConfigBurstRemaining > 0) {
-                    --startupConfigBurstRemaining;
-                }
-                if (startupConfigBurstRemaining <= 0) {
-                    configBeaconForced = false;
-                }
-            }
-
-            if (sessionMode == SessionMode::DuplexArq) {
-                int ackBudget = 4;
-                while (!pendingAcks.empty() && ackBudget-- > 0) {
-                    const std::vector<uint8_t> ackBytes = serializeAckPacket(pendingAcks.front());
-                    enqueueAcousticPayload(AcousticPayloadType::Ack, nextAcousticSeq++, ackBytes, 0U);
-                    pendingAcks.pop_front();
                 }
 
-                std::vector<uint32_t> dropSeq;
-                int retransmitBudget = 3;
-                for (auto &entry : pendingArq) {
-                    PendingPacket &pending = entry.second;
-                    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - pending.sentAt).count();
-                    if (age < sessionConfig.arqTimeoutMs) {
-                        continue;
+                if (roleSend) {
+                    const bool periodicBeacon =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - lastConfigBeacon).count() >= 2500;
+                    if (startupConfigBurstRemaining > 0 || forceConfigBurst || periodicBeacon) {
+                        router.enqueueConfig(serializeSessionConfigV2(sessionConfigV2));
+                        if (startupConfigBurstRemaining > 0) {
+                            --startupConfigBurstRemaining;
+                        }
+                        if (startupConfigBurstRemaining <= 0) {
+                            forceConfigBurst = false;
+                        }
+                        lastConfigBeacon = now;
                     }
-                    if (pending.retransmits >= sessionConfig.arqMaxRetransmit) {
-                        dropSeq.push_back(entry.first);
-                        continue;
+
+                    const std::size_t sendBudget = (transportKind == TransportKind::Optical) ? 2 : 8;
+                    std::vector<RouterOutgoing> outgoing =
+                        router.collectOutgoing(sendBudget, now, sessionConfigV2.reliableRetryMs, sessionConfigV2.reliableMaxRetries);
+                    for (const auto &packet : outgoing) {
+                        std::string persistError;
+                        (void)store.persistOutbound(
+                            packet.header, packet.payload, isRelayablePayloadType(packet.header.payloadType), persistError);
+
+                        std::vector<std::vector<uint8_t>> frags =
+                            fragmentCommPayload(packet.payload, transportFragmentBytes(transportKind));
+                        const uint16_t fragCount = static_cast<uint16_t>(std::min<std::size_t>(frags.size(), 0xFFFFU));
+                        for (uint16_t frag = 0; frag < fragCount; ++frag) {
+                            CommEnvelopeHeader fragmentHeader = packet.header;
+                            fragmentHeader.fragIndex = frag;
+                            fragmentHeader.fragCount = std::max<uint16_t>(1, fragCount);
+                            const std::vector<uint8_t> envelope =
+                                serializeCommEnvelope(fragmentHeader, frags[static_cast<std::size_t>(frag)]);
+                            adapter->sendEnvelope(envelope);
+                        }
+                        linkPayloadBytesSent += packet.payload.size();
                     }
-                    if (retransmitBudget <= 0) {
-                        break;
+                }
+
+                if (transportKind == TransportKind::Acoustic) {
+                    const LinkStats delta = transportManager.acoustic().takeAndResetLinkStats();
+                    linkStats.syncLocked = linkStats.syncLocked || delta.syncLocked;
+                    linkStats.fecRecoveredCount += delta.fecRecoveredCount;
+                    linkStats.framesReceived += delta.framesReceived;
+                    linkStats.framesDropped += delta.framesDropped;
+                    linkStats.retransmitCount += delta.retransmitCount;
+                    if (delta.rttMs > 0.0) {
+                        linkStats.rttMs = delta.rttMs;
                     }
-                    enqueueAcousticPayload(AcousticPayloadType::Data, pending.seq, pending.bytes, 0x2U);
-                    pending.sentAt = now;
-                    pending.retransmits += 1;
-                    linkStats.retransmitCount += 1;
-                    --retransmitBudget;
+                    linkStats.berEstimate = delta.berEstimate;
                 }
-                for (uint32_t seq : dropSeq) {
-                    pendingArq.erase(seq);
-                    linkStats.framesDropped += 1;
-                }
-            }
-
-            while (!pendingTxPayloads.empty() &&
-                   (sessionMode != SessionMode::DuplexArq ||
-                    pendingArq.size() < std::max<std::size_t>(1, sessionConfig.arqWindow))) {
-                TxCodecPayload txPayload = std::move(pendingTxPayloads.front());
-                pendingTxPayloads.pop_front();
-
-                const uint32_t seq = nextAcousticSeq++;
-                enqueueAcousticPayload(AcousticPayloadType::Data, seq, txPayload.bytes, txPayload.flags);
-
-                if (sessionMode == SessionMode::DuplexArq) {
-                    PendingPacket pending;
-                    pending.seq = seq;
-                    pending.bytes = txPayload.bytes;
-                    pending.sentAt = now;
-                    pending.retransmits = 0;
-                    pendingArq[seq] = std::move(pending);
-                }
-
-                linkPayloadBytesSent += txPayload.bytes.size();
             }
         }
 
-        if (txControlEnabled && txSlot && audioEngine.playbackRunning()) {
-            int burstBudget = 2;
-            while (!txRawFrameQueue.empty() && burstBudget-- > 0) {
-                const std::vector<float> pcm = modem->modulateFrame(
-                    txRawFrameQueue.front(), sessionConfig.fecRepetition, sessionConfig.interleaveDepth);
-                audioEngine.pushPlayback(pcm);
-                txRawFrameQueue.pop_front();
-            }
-        }
+        queueStats = router.queueStats();
+        const std::vector<TextMessage> timeline = router.timelineAfter(0, 256);
+        const uint64_t latestTextCursor = timeline.empty() ? 0 : timeline.back().msgId;
 
-        if (demodTotalSymbols > 0) {
-            linkStats.berEstimate =
-                static_cast<double>(demodRecoveredSymbols) / static_cast<double>(std::max<uint64_t>(1, demodTotalSymbols));
-        }
         const double linkElapsed = std::max(
             0.001, std::chrono::duration_cast<std::chrono::duration<double>>(now - linkStartTime).count());
         linkStats.effectivePayloadKbps =
@@ -2744,23 +2952,26 @@ int main() {
             sentPanel = renderForDisplay(latestSentFrame, panelSize, false, true, params.blockSize);
             drawFaceRects(sentPanel, rawFacesPanel, cv::Scalar(0, 220, 220));
         }
+        if (transportKind == TransportKind::Optical) {
+            cv::Mat optical = transportManager.optical().currentTxPattern();
+            if (!optical.empty()) {
+                cv::resize(optical, sentPanel, panelSize, 0.0, 0.0, cv::INTER_NEAREST);
+            }
+        }
 
         cv::Mat receivedPanel(panelHeight, panelWidth, CV_8UC3, cv::Scalar(20, 20, 20));
         if (interpolation.hasCurrent) {
             Gray4Frame displayFrame = interpolation.current;
             if (interpolation.hasPair) {
                 const double interval = 1.0 / std::max(0.1, params.targetFps);
-                const double alpha = std::clamp(std::chrono::duration_cast<std::chrono::duration<double>>(now -
-                                                                                                           interpolation
-                                                                                                               .blendStart)
-                                                    .count() /
-                                                    std::max(0.001, interval),
-                                                0.0,
-                                                1.0);
+                const double alpha = std::clamp(
+                    std::chrono::duration_cast<std::chrono::duration<double>>(now - interpolation.blendStart).count() /
+                        std::max(0.001, interval),
+                    0.0,
+                    1.0);
                 displayFrame = interpolateMotionCompensated(
                     interpolation.previous, interpolation.current, interpolation.motion, params.blockSize, alpha);
             }
-
             receivedPanel =
                 renderForDisplay(displayFrame, panelSize, useReceivedEnhancement, useReceivedDithering, params.blockSize);
             drawFaceRects(receivedPanel, rawFacesPanel, cv::Scalar(150, 255, 100));
@@ -2770,21 +2981,23 @@ int main() {
         std::vector<uint8_t> sentJpeg = encodeJpeg(sentPanel, 82);
         std::vector<uint8_t> receivedJpeg = encodeJpeg(receivedPanel, 82);
 
+        std::string transportStatus = "stopped";
+        if (TransportAdapter *adapter = transportManager.activeAdapter()) {
+            transportStatus = adapter->status();
+        }
+
         {
             std::lock_guard<std::mutex> lock(shared.mutex);
             shared.rawJpeg = std::move(rawJpeg);
             shared.sentJpeg = std::move(sentJpeg);
             shared.receivedJpeg = std::move(receivedJpeg);
-
             shared.metrics = latestMetrics;
             shared.meta = latestMeta;
             shared.latestPacketBytes = latestPacketBytes;
             shared.haveStats = haveStats;
-
             shared.faceDetectorReady = faceDetectorReady;
             shared.facesNow = static_cast<int>(lastFacesRaw.size());
             shared.facesGathered = gatheredFaces.size();
-
             shared.mode = params.mode;
             shared.width = params.width;
             shared.height = params.height;
@@ -2795,12 +3008,12 @@ int main() {
             shared.recordingEnabled = recordingEnabled;
             shared.keyframeInterval = activeKeyframeInterval(params, shortKeyframeInterval);
             shared.cameraIndex = cameraIndex;
-            shared.linkMode = linkMode;
+            shared.linkRole = linkRole;
             shared.rxSource = rxSource;
             shared.sessionMode = sessionMode;
             shared.bandMode = bandMode;
             shared.linkRunning = linkRunning;
-            shared.linkTxSlot = txSlot;
+            shared.linkTxSlot = roleSend;
             shared.audioInputDevice = audioInputDevice;
             shared.audioOutputDevice = audioOutputDevice;
             shared.mediaPath = mediaPath;
@@ -2808,10 +3021,23 @@ int main() {
             shared.streamId = sessionConfig.streamId;
             shared.configVersion = sessionConfig.configVersion;
             shared.configHash = sessionConfig.configHash;
+            shared.transportKind = transportKind;
+            shared.transportStatus = transportStatus;
+            shared.serialPort = serialPort;
+            shared.serialBaud = serialBaud;
+            shared.nodeAlias = nodeAlias;
+            shared.relayExportPath = relayExportPath;
+            shared.relayImportPath = relayImportPath;
+            shared.queueStats = queueStats;
+            shared.messages = timeline;
+            shared.latestTextCursor = latestTextCursor;
+            shared.fallbackStage = FallbackStage::Normal;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(3));
     }
+
+    stopAllTransports();
 
     if (recordingFile.is_open()) {
         recordingFile.close();
