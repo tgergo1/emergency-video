@@ -1,0 +1,175 @@
+name: Portable Artifacts + Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-unix:
+    name: Build/Test/Package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: emergency-video-portable-linux
+          - os: macos-latest
+            artifact_name: emergency-video-portable-macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build \
+            pkg-config \
+            libopencv-dev \
+            libavformat-dev \
+            libavcodec-dev \
+            libavutil-dev \
+            libswresample-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install ninja pkg-config opencv ffmpeg
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEV_BUILD_TESTS=ON \
+            -DEV_PORTABLE_BUNDLE_SYSTEM_LIBS=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run unit tests (CTest)
+        run: ctest --test-dir build --build-config Release --output-on-failure --verbose
+
+      - name: Build portable package
+        run: cmake --build build --config Release --target portable
+
+      - name: Verify portable executable exists
+        run: test -f build/portable/emergency_video
+
+      - name: Verify packaged dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          missing=0
+          shopt -s nullglob
+          for f in build/portable/emergency_video build/portable/*.so*; do
+            if ldd "$f" | grep -q "not found"; then
+              echo "Missing runtime dependency in $f"
+              ldd "$f" || true
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Verify packaged dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in build/portable/emergency_video build/portable/*.dylib; do
+            deps=$(otool -L "$f" | awk '/^\t@rpath\//{print $1}')
+            for d in $deps; do
+              base=$(basename "$d")
+              if [ ! -e "build/portable/$base" ]; then
+                echo "Missing dependency $base required by $(basename "$f")"
+                missing=1
+              fi
+            done
+          done
+          test "$missing" -eq 0
+
+      - name: Pack artifact
+        run: |
+          cd build
+          tar -czf "${{ matrix.artifact_name }}.tar.gz" portable
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: build/${{ matrix.artifact_name }}.tar.gz
+          if-no-files-found: error
+
+  build-windows-msys2:
+    name: Build/Test/Package (windows-msys2)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 toolchain and dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-opencv
+            mingw-w64-x86_64-ffmpeg
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEV_BUILD_TESTS=ON \
+            -DEV_PORTABLE_BUNDLE_SYSTEM_LIBS=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run unit tests (CTest)
+        run: ctest --test-dir build --build-config Release --output-on-failure --verbose
+
+      - name: Build portable package
+        run: cmake --build build --config Release --target portable
+
+      - name: Verify portable executable exists
+        run: test -f build/portable/emergency_video.exe
+
+      - name: Verify packaged dependencies (Windows/MSYS2)
+        run: |
+          set -euo pipefail
+          missing=0
+          shopt -s nullglob
+          for f in build/portable/emergency_video.exe build/portable/*.dll; do
+            if ldd "$f" | grep -q "not found"; then
+              echo "Missing runtime dependency in $f"
+              ldd "$f" || true
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Pack artifact
+        run: |
+          cd build
+          tar -czf emergency-video-portable-windows.tar.gz portable
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emergency-video-portable-windows
+          path: build/emergency-video-portable-windows.tar.gz
+          if-no-files-found: error

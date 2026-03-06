@@ -1,0 +1,63 @@
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+*~
+
+# CMake / build outputs
+/build/
+/build*/
+/cmake-build-*/
+/out/
+/dist/
+/Debug/
+/Release/
+/RelWithDebInfo/
+/MinSizeRel/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+Testing/
+
+# Compiler / linker artifacts
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.exp
+*.pdb
+*.ilk
+*.out
+*.app
+*.dSYM/
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Generated runtime artifacts
+*.evs

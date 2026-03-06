@@ -1,0 +1,275 @@
+set(_ev_exe_base "${CMAKE_INSTALL_PREFIX}/@EV_PORTABLE_BINDIR@/emergency_video")
+set(_ev_exe "")
+set(_ev_exe_candidates "")
+if(CMAKE_EXECUTABLE_SUFFIX)
+    list(APPEND _ev_exe_candidates "${_ev_exe_base}${CMAKE_EXECUTABLE_SUFFIX}")
+endif()
+if(WIN32)
+    list(APPEND _ev_exe_candidates "${_ev_exe_base}.exe")
+endif()
+list(APPEND _ev_exe_candidates "${_ev_exe_base}")
+list(REMOVE_DUPLICATES _ev_exe_candidates)
+
+foreach(_candidate IN LISTS _ev_exe_candidates)
+    if(EXISTS "${_candidate}")
+        set(_ev_exe "${_candidate}")
+        break()
+    endif()
+endforeach()
+
+if(NOT _ev_exe)
+    message(FATAL_ERROR "Portable dependency bundling failed: executable not found. Checked: ${_ev_exe_candidates}")
+endif()
+get_filename_component(_ev_exe "${_ev_exe}" REALPATH)
+get_filename_component(_ev_runtime_dir "${_ev_exe}" DIRECTORY)
+
+set(_ev_search_dirs "@EV_RUNTIME_SEARCH_DIRS@")
+set(_ev_bundle_system_libs "@EV_PORTABLE_BUNDLE_SYSTEM_LIBS@")
+list(APPEND _ev_search_dirs "${_ev_runtime_dir}")
+
+if(APPLE)
+    list(APPEND _ev_search_dirs "/opt/homebrew/lib" "/usr/local/lib")
+    find_program(_ev_brew_exec brew)
+    if(_ev_brew_exec)
+        execute_process(
+            COMMAND "${_ev_brew_exec}" --prefix
+            OUTPUT_VARIABLE _ev_brew_prefix
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_ev_brew_prefix)
+            list(APPEND _ev_search_dirs "${_ev_brew_prefix}/lib")
+            file(GLOB _ev_brew_opt_lib_dirs LIST_DIRECTORIES TRUE "${_ev_brew_prefix}/opt/*/lib")
+            list(APPEND _ev_search_dirs ${_ev_brew_opt_lib_dirs})
+        endif()
+    endif()
+elseif(UNIX)
+    list(APPEND _ev_search_dirs "/usr/local/lib" "/usr/lib" "/lib")
+endif()
+
+list(REMOVE_DUPLICATES _ev_search_dirs)
+set(_ev_existing_search_dirs "")
+foreach(_dir IN LISTS _ev_search_dirs)
+    if(EXISTS "${_dir}")
+        list(APPEND _ev_existing_search_dirs "${_dir}")
+    endif()
+endforeach()
+
+set(_ev_dep_args
+    EXECUTABLES "${_ev_exe}"
+    RESOLVED_DEPENDENCIES_VAR _ev_resolved_deps
+    UNRESOLVED_DEPENDENCIES_VAR _ev_unresolved_deps
+    DIRECTORIES ${_ev_existing_search_dirs}
+)
+if(APPLE)
+    list(APPEND _ev_dep_args POST_EXCLUDE_REGEXES "^/System/Library/.*" "^/usr/lib/.*")
+elseif(UNIX AND NOT _ev_bundle_system_libs)
+    list(APPEND _ev_dep_args POST_EXCLUDE_REGEXES "^/lib/.*" "^/usr/lib/.*")
+endif()
+
+file(GET_RUNTIME_DEPENDENCIES ${_ev_dep_args})
+
+set(_ev_all_deps ${_ev_resolved_deps})
+set(_ev_resolved_from_unresolved "")
+set(_ev_still_unresolved "")
+foreach(_missing IN LISTS _ev_unresolved_deps)
+    get_filename_component(_missing_name "${_missing}" NAME)
+    set(_resolved_missing "")
+    foreach(_dir IN LISTS _ev_existing_search_dirs)
+        if(EXISTS "${_dir}/${_missing_name}")
+            set(_resolved_missing "${_dir}/${_missing_name}")
+            break()
+        endif()
+    endforeach()
+    if(_resolved_missing)
+        list(APPEND _ev_resolved_from_unresolved "${_resolved_missing}")
+    else()
+        list(APPEND _ev_still_unresolved "${_missing}")
+    endif()
+endforeach()
+list(APPEND _ev_all_deps ${_ev_resolved_from_unresolved})
+list(REMOVE_DUPLICATES _ev_all_deps)
+
+if(_ev_all_deps)
+    set(_ev_dep_args_pass2
+        LIBRARIES ${_ev_all_deps}
+        RESOLVED_DEPENDENCIES_VAR _ev_resolved_deps_pass2
+        UNRESOLVED_DEPENDENCIES_VAR _ev_unresolved_deps_pass2
+        DIRECTORIES ${_ev_existing_search_dirs}
+    )
+    if(APPLE)
+        list(APPEND _ev_dep_args_pass2 POST_EXCLUDE_REGEXES "^/System/Library/.*" "^/usr/lib/.*")
+    elseif(UNIX AND NOT _ev_bundle_system_libs)
+        list(APPEND _ev_dep_args_pass2 POST_EXCLUDE_REGEXES "^/lib/.*" "^/usr/lib/.*")
+    endif()
+
+    file(GET_RUNTIME_DEPENDENCIES ${_ev_dep_args_pass2})
+    list(APPEND _ev_all_deps ${_ev_resolved_deps_pass2})
+    list(REMOVE_DUPLICATES _ev_all_deps)
+
+    foreach(_missing IN LISTS _ev_unresolved_deps_pass2)
+        get_filename_component(_missing_name "${_missing}" NAME)
+        set(_resolved_missing "")
+        foreach(_dir IN LISTS _ev_existing_search_dirs)
+            if(EXISTS "${_dir}/${_missing_name}")
+                set(_resolved_missing "${_dir}/${_missing_name}")
+                break()
+            endif()
+        endforeach()
+        if(_resolved_missing)
+            list(APPEND _ev_all_deps "${_resolved_missing}")
+        else()
+            list(APPEND _ev_still_unresolved "${_missing}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _ev_all_deps)
+endif()
+list(REMOVE_DUPLICATES _ev_still_unresolved)
+
+if(_ev_still_unresolved)
+    message(WARNING "Unresolved runtime dependencies: ${_ev_still_unresolved}")
+endif()
+
+set(_ev_copied_count 0)
+foreach(_dep IN LISTS _ev_all_deps)
+    if(NOT EXISTS "${_dep}")
+        continue()
+    endif()
+    file(COPY "${_dep}" DESTINATION "${_ev_runtime_dir}" FOLLOW_SYMLINK_CHAIN)
+    math(EXPR _ev_copied_count "${_ev_copied_count} + 1")
+endforeach()
+
+if(APPLE)
+    function(ev_collect_rpath_dep_names out_var)
+        set(_names "")
+        foreach(_bin IN LISTS ARGN)
+            if(NOT EXISTS "${_bin}")
+                continue()
+            endif()
+            execute_process(
+                COMMAND otool -L "${_bin}"
+                OUTPUT_VARIABLE _otool_out
+                ERROR_QUIET
+            )
+            string(REPLACE "\n" ";" _lines "${_otool_out}")
+            foreach(_line IN LISTS _lines)
+                string(REGEX MATCH "^[ \t]+(@rpath/[^ \t]+)" _match "${_line}")
+                if(_match)
+                    get_filename_component(_name "${CMAKE_MATCH_1}" NAME)
+                    list(APPEND _names "${_name}")
+                endif()
+            endforeach()
+        endforeach()
+        list(REMOVE_DUPLICATES _names)
+        set(${out_var} "${_names}" PARENT_SCOPE)
+    endfunction()
+
+    set(_ev_scan_items "${_ev_exe}")
+    file(GLOB _ev_scan_dylibs "${_ev_runtime_dir}/*.dylib")
+    list(APPEND _ev_scan_items ${_ev_scan_dylibs})
+    ev_collect_rpath_dep_names(_ev_required_rpath_libs ${_ev_scan_items})
+
+    foreach(_required IN LISTS _ev_required_rpath_libs)
+        if(EXISTS "${_ev_runtime_dir}/${_required}")
+            continue()
+        endif()
+        string(REGEX REPLACE "\\.dylib$" "" _required_stem "${_required}")
+        file(GLOB _candidate_libs "${_ev_runtime_dir}/${_required_stem}*.dylib")
+        if(_candidate_libs)
+            list(SORT _candidate_libs)
+            list(GET _candidate_libs 0 _candidate)
+            get_filename_component(_candidate_name "${_candidate}" NAME)
+            if(NOT _candidate_name STREQUAL _required)
+                execute_process(
+                    COMMAND "${CMAKE_COMMAND}" -E create_symlink "${_candidate_name}" "${_ev_runtime_dir}/${_required}"
+                )
+            endif()
+        endif()
+    endforeach()
+endif()
+
+if(APPLE)
+    find_program(_ev_install_name_tool install_name_tool)
+    if(NOT _ev_install_name_tool)
+        message(FATAL_ERROR "install_name_tool not found; cannot finalize macOS portable package.")
+    endif()
+
+    function(ev_patch_macos_binary _binary _is_executable)
+        if(NOT EXISTS "${_binary}")
+            return()
+        endif()
+
+        execute_process(COMMAND chmod u+w "${_binary}")
+        execute_process(
+            COMMAND otool -L "${_binary}"
+            OUTPUT_VARIABLE _otool_out
+            ERROR_QUIET
+        )
+        string(REPLACE "\n" ";" _lines "${_otool_out}")
+        foreach(_line IN LISTS _lines)
+            string(REGEX MATCH "^[ \t]+([^ \t]+)" _match "${_line}")
+            if(NOT _match)
+                continue()
+            endif()
+            string(STRIP "${CMAKE_MATCH_1}" _dep_path)
+            if(_dep_path STREQUAL "")
+                continue()
+            endif()
+            if(_dep_path MATCHES "^/System/Library/" OR _dep_path MATCHES "^/usr/lib/")
+                continue()
+            endif()
+
+            get_filename_component(_dep_name "${_dep_path}" NAME)
+            set(_new_dep_path "@rpath/${_dep_name}")
+            if(NOT _dep_path STREQUAL _new_dep_path)
+                execute_process(
+                    COMMAND "${_ev_install_name_tool}" -change "${_dep_path}" "${_new_dep_path}" "${_binary}"
+                    RESULT_VARIABLE _change_result
+                )
+                if(NOT _change_result EQUAL 0)
+                    message(FATAL_ERROR "install_name_tool -change failed for ${_binary}: ${_dep_path} -> ${_new_dep_path}")
+                endif()
+            endif()
+        endforeach()
+
+        if(_is_executable)
+            execute_process(
+                COMMAND "${_ev_install_name_tool}" -add_rpath "@executable_path" "${_binary}"
+                RESULT_VARIABLE _rpath_result
+                ERROR_QUIET
+            )
+        else()
+            get_filename_component(_name "${_binary}" NAME)
+            execute_process(
+                COMMAND "${_ev_install_name_tool}" -id "@rpath/${_name}" "${_binary}"
+                RESULT_VARIABLE _id_result
+            )
+            if(NOT _id_result EQUAL 0)
+                message(FATAL_ERROR "install_name_tool -id failed for ${_binary}")
+            endif()
+            execute_process(
+                COMMAND "${_ev_install_name_tool}" -add_rpath "@loader_path" "${_binary}"
+                RESULT_VARIABLE _rpath_result
+                ERROR_QUIET
+            )
+        endif()
+    endfunction()
+
+    set(_ev_patch_items "${_ev_exe}")
+    file(GLOB _ev_dylibs "${_ev_runtime_dir}/*.dylib")
+    list(APPEND _ev_patch_items ${_ev_dylibs})
+    list(REMOVE_DUPLICATES _ev_patch_items)
+
+    foreach(_item IN LISTS _ev_patch_items)
+        if(IS_SYMLINK "${_item}")
+            continue()
+        endif()
+        if(_item STREQUAL "${_ev_exe}")
+            ev_patch_macos_binary("${_item}" TRUE)
+        else()
+            ev_patch_macos_binary("${_item}" FALSE)
+        endif()
+    endforeach()
+endif()
+
+message(STATUS "Portable dependency bundling complete. Copied ${_ev_copied_count} runtime dependencies to ${_ev_runtime_dir}")
