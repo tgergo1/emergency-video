@@ -12,9 +12,11 @@
 #include <string>
 #include <system_error>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+#endif
 
 #include <opencv2/imgproc.hpp>
 
@@ -25,6 +27,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
+#ifndef _WIN32
 speed_t toSpeed(int baud) {
     switch (baud) {
     case 9600:
@@ -45,6 +48,7 @@ speed_t toSpeed(int baud) {
         return B115200;
     }
 }
+#endif
 
 std::vector<uint8_t> addCrc(const std::vector<uint8_t> &payload) {
     std::vector<uint8_t> out = payload;
@@ -277,6 +281,14 @@ TransportKind SerialAdapter::kind() const {
 }
 
 std::vector<std::string> SerialAdapter::listCandidatePorts() {
+#ifdef _WIN32
+    std::vector<std::string> out;
+    out.reserve(16);
+    for (int i = 1; i <= 16; ++i) {
+        out.push_back("COM" + std::to_string(i));
+    }
+    return out;
+#else
     std::vector<std::string> out;
     for (const auto &entry : fs::directory_iterator("/dev")) {
         if (!entry.is_character_file()) {
@@ -290,9 +302,15 @@ std::vector<std::string> SerialAdapter::listCandidatePorts() {
     }
     std::sort(out.begin(), out.end());
     return out;
+#endif
 }
 
 bool SerialAdapter::openPort(const std::string &path, std::string &error) {
+#ifdef _WIN32
+    (void)path;
+    error = "serial adapter is not supported in this Windows build";
+    return false;
+#else
     error.clear();
     fd_ = ::open(path.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd_ < 0) {
@@ -328,9 +346,14 @@ bool SerialAdapter::openPort(const std::string &path, std::string &error) {
 
     activePort_ = path;
     return true;
+#endif
 }
 
 bool SerialAdapter::start(std::string &error) {
+#ifdef _WIN32
+    error = "serial adapter is not supported in this Windows build";
+    return false;
+#else
     error.clear();
     if (fd_ >= 0) {
         return true;
@@ -350,11 +373,14 @@ bool SerialAdapter::start(std::string &error) {
         error = "no serial port available";
     }
     return false;
+#endif
 }
 
 void SerialAdapter::stop() {
     if (fd_ >= 0) {
+#ifndef _WIN32
         ::close(fd_);
+#endif
         fd_ = -1;
     }
     activePort_.clear();
@@ -363,7 +389,11 @@ void SerialAdapter::stop() {
 }
 
 bool SerialAdapter::running() const {
+#ifdef _WIN32
+    return false;
+#else
     return fd_ >= 0;
+#endif
 }
 
 std::vector<uint8_t> SerialAdapter::slipEncode(const std::vector<uint8_t> &bytes) {
@@ -431,6 +461,10 @@ bool SerialAdapter::slipTryDecodeOne(std::vector<uint8_t> &buffer, std::vector<u
 }
 
 void SerialAdapter::sendEnvelope(const std::vector<uint8_t> &envelope) {
+#ifdef _WIN32
+    (void)envelope;
+    return;
+#else
     if (fd_ < 0) {
         return;
     }
@@ -451,10 +485,14 @@ void SerialAdapter::sendEnvelope(const std::vector<uint8_t> &envelope) {
         }
         txQueue_.pop_front();
     }
+#endif
 }
 
 void SerialAdapter::pollIncoming(std::vector<std::vector<uint8_t>> &outEnvelopes) {
     outEnvelopes.clear();
+#ifdef _WIN32
+    return;
+#else
     if (fd_ < 0) {
         return;
     }
@@ -481,13 +519,18 @@ void SerialAdapter::pollIncoming(std::vector<std::vector<uint8_t>> &outEnvelopes
             outEnvelopes.push_back(std::move(payload));
         }
     }
+#endif
 }
 
 std::string SerialAdapter::status() const {
+#ifdef _WIN32
+    return "serial unsupported on Windows in this build";
+#else
     if (fd_ < 0) {
         return "serial stopped";
     }
     return "serial running on " + activePort_;
+#endif
 }
 
 OpticalAdapter::OpticalAdapter() = default;

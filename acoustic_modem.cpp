@@ -10,6 +10,7 @@
 namespace {
 constexpr uint8_t kWireMagicA = 0x6A;
 constexpr uint8_t kWireMagicB = 0xC3;
+constexpr double kPi = 3.14159265358979323846;
 
 void appendU16(std::vector<uint8_t> &out, uint16_t value) {
     out.push_back(static_cast<uint8_t>(value & 0xFFU));
@@ -73,7 +74,7 @@ double goertzelPower(const float *samples, std::size_t count, double freq, uint3
     }
 
     const double k = std::round((static_cast<double>(count) * freq) / static_cast<double>(sampleRate));
-    const double omega = (2.0 * M_PI * k) / static_cast<double>(count);
+    const double omega = (2.0 * kPi * k) / static_cast<double>(count);
     const double coeff = 2.0 * std::cos(omega);
 
     double q0 = 0.0;
@@ -253,7 +254,7 @@ std::vector<float> MfskModem::modulateFrame(const std::vector<uint8_t> &rawFrame
 
     for (uint8_t symbol : symbols) {
         const double freq = frequencies_[symbol % frequencies_.size()];
-        const double step = (2.0 * M_PI * freq) / static_cast<double>(params_.sampleRate);
+        const double step = (2.0 * kPi * freq) / static_cast<double>(params_.sampleRate);
         double phase = 0.0;
         for (uint16_t n = 0; n < params_.symbolSamples; ++n) {
             float s = static_cast<float>(params_.amplitude * std::sin(phase));
