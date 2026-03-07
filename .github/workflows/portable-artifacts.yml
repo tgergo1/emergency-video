@@ -154,7 +154,8 @@ jobs:
           missing=0
           shopt -s nullglob
           for f in build/portable/emergency_video.exe build/portable/*.dll; do
-            if ldd "$f" | grep -q "not found"; then
+            unresolved=$(ldd "$f" | awk '/=> not found/{print $1}' | grep -Evi '^(api-ms-win-|ext-ms-)' || true)
+            if [ -n "$unresolved" ]; then
               echo "Missing runtime dependency in $f"
               ldd "$f" || true
               missing=1
