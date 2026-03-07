@@ -61,10 +61,21 @@ set(_ev_dep_args
     UNRESOLVED_DEPENDENCIES_VAR _ev_unresolved_deps
     DIRECTORIES ${_ev_existing_search_dirs}
 )
+if(WIN32)
+    set(_ev_windows_dep_exclude_args
+        PRE_EXCLUDE_REGEXES
+            "^api-ms-win-.*"
+            "^ext-ms-.*"
+        POST_EXCLUDE_REGEXES
+            ".*[Ww]indows[\\\\/](System32|SysWOW64|WinSxS)[\\\\/].*"
+    )
+endif()
 if(APPLE)
     list(APPEND _ev_dep_args POST_EXCLUDE_REGEXES "^/System/Library/.*" "^/usr/lib/.*")
 elseif(UNIX AND NOT _ev_bundle_system_libs)
     list(APPEND _ev_dep_args POST_EXCLUDE_REGEXES "^/lib/.*" "^/usr/lib/.*")
+elseif(WIN32)
+    list(APPEND _ev_dep_args ${_ev_windows_dep_exclude_args})
 endif()
 
 file(GET_RUNTIME_DEPENDENCIES ${_ev_dep_args})
@@ -101,6 +112,8 @@ if(_ev_all_deps)
         list(APPEND _ev_dep_args_pass2 POST_EXCLUDE_REGEXES "^/System/Library/.*" "^/usr/lib/.*")
     elseif(UNIX AND NOT _ev_bundle_system_libs)
         list(APPEND _ev_dep_args_pass2 POST_EXCLUDE_REGEXES "^/lib/.*" "^/usr/lib/.*")
+    elseif(WIN32)
+        list(APPEND _ev_dep_args_pass2 ${_ev_windows_dep_exclude_args})
     endif()
 
     file(GET_RUNTIME_DEPENDENCIES ${_ev_dep_args_pass2})
@@ -125,6 +138,10 @@ if(_ev_all_deps)
     list(REMOVE_DUPLICATES _ev_all_deps)
 endif()
 list(REMOVE_DUPLICATES _ev_still_unresolved)
+if(WIN32)
+    list(FILTER _ev_still_unresolved EXCLUDE REGEX "^api-ms-win-.*")
+    list(FILTER _ev_still_unresolved EXCLUDE REGEX "^ext-ms-.*")
+endif()
 
 if(_ev_still_unresolved)
     message(WARNING "Unresolved runtime dependencies: ${_ev_still_unresolved}")
