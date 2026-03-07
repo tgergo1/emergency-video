@@ -112,6 +112,9 @@ elseif(UNIX)
 endif()
 
 target_link_libraries(emergency_video PRIVATE ${OpenCV_LIBS} PkgConfig::FFMPEG)
+if(WIN32)
+    target_link_libraries(emergency_video PRIVATE ws2_32)
+endif()
 target_include_directories(emergency_video PRIVATE ${OpenCV_INCLUDE_DIRS} ${FFMPEG_INCLUDE_DIRS})
 
 if(MSVC)
