@@ -1337,7 +1337,7 @@ std::string makeIndexHtml() {
               <div class="hint">The reconstructed inbound stream is shown below. Keep the link role set to <b>Receive</b> or <b>Duplex</b> to ingest data.</div>
               <div class="receive-preview">
                 <div class="label">Reconstructed Incoming Stream</div>
-                <img id="feedReceivedFocus" class="feedimg" alt="received focus" />
+                <img id="feedReceivedFocus" class="feedimg" alt="reconstructed incoming video stream" />
               </div>
               <div class="status-grid">
                 <div id="recvSyncStat">sync --</div>
