@@ -1194,6 +1194,29 @@ std::string makeIndexHtml() {
     }
     .msg { padding: 7px 8px; border: 1px solid #2d4037; border-radius: 8px; background: #111b16; }
     .msg .meta { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
+    .receive-preview {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #0f1713;
+    }
+    .receive-preview .label {
+      font-size: 11px;
+      letter-spacing: .06em;
+    }
+    .status-grid {
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    }
+    .status-grid > div {
+      border: 1px solid #2d4037;
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: #111b16;
+      font-size: 12px;
+      color: var(--muted);
+    }
     .stats {
       font-size: 12px;
       color: var(--muted);
@@ -1310,7 +1333,25 @@ std::string makeIndexHtml() {
 
           <section id="tabReceive" class="tab">
             <div class="section">
-              <h3>Receive & Relay</h3>
+              <h3>Incoming Data</h3>
+              <div class="hint">The reconstructed inbound stream is shown below. Keep the link role set to <b>Receive</b> or <b>Duplex</b> to ingest data.</div>
+              <div class="receive-preview">
+                <div class="label">Reconstructed Incoming Stream</div>
+                <img id="feedReceivedFocus" class="feedimg" alt="received focus" />
+              </div>
+              <div class="status-grid">
+                <div id="recvSyncStat">sync --</div>
+                <div id="recvFrameStat">frames --</div>
+                <div id="recvPayloadStat">payload --</div>
+                <div id="recvLossStat">loss --</div>
+              </div>
+            </div>
+            <div class="section">
+              <h3>File Relay</h3>
+              <div class="hint">Use defaults unless your deployment requires custom folders.</div>
+              <div class="actions">
+                <button id="useDefaultRelayPathsBtn" class="btn">Use Default Paths</button>
+              </div>
               <div class="grid">
                 <div class="field full"><label>Relay Export Bundle</label><input id="relayExportInput" type="text" placeholder="./relay_out/export.evrelay" /></div>
                 <div class="field full"><label>Relay Import Bundle</label><input id="relayImportInput" type="text" placeholder="./relay_in/import.evrelay" /></div>
@@ -1385,6 +1426,8 @@ std::string makeIndexHtml() {
   </div>
 
   <script>
+    const DEFAULT_RELAY_EXPORT_PATH = './relay_out/export.evrelay';
+    const DEFAULT_RELAY_IMPORT_PATH = './relay_in/import.evrelay';
     const stateStore = { latest: null, formDirty: false, cursor: 0 };
 
     const TAB_IDS = ['Link', 'Send', 'Receive', 'Status', 'Advanced'];
@@ -1402,6 +1445,11 @@ std::string makeIndexHtml() {
 
     function text(v, d = '') {
       return (typeof v === 'string' && v.length > 0) ? v : d;
+    }
+
+    function relayPath(v, fallback) {
+      const t = (typeof v === 'string') ? v.trim() : '';
+      return t.length > 0 ? t : fallback;
     }
 
     async function postJson(url, body) {
@@ -1494,10 +1542,10 @@ std::string makeIndexHtml() {
         document.getElementById('mediaPathInput').value = data.media_path || '';
         document.getElementById('serialPortInput').value = data.serial_port || '';
         document.getElementById('serialBaudInput').value = num(data.serial_baud, 115200).toFixed(0);
-        document.getElementById('relayExportInput').value = data.relay_export_path || '';
-        document.getElementById('relayImportInput').value = data.relay_import_path || '';
-        document.getElementById('relayExportAdvInput').value = data.relay_export_path || '';
-        document.getElementById('relayImportAdvInput').value = data.relay_import_path || '';
+        document.getElementById('relayExportInput').value = relayPath(data.relay_export_path, DEFAULT_RELAY_EXPORT_PATH);
+        document.getElementById('relayImportInput').value = relayPath(data.relay_import_path, DEFAULT_RELAY_IMPORT_PATH);
+        document.getElementById('relayExportAdvInput').value = relayPath(data.relay_export_path, DEFAULT_RELAY_EXPORT_PATH);
+        document.getElementById('relayImportAdvInput').value = relayPath(data.relay_import_path, DEFAULT_RELAY_IMPORT_PATH);
       }
 
       document.getElementById('startBtn').disabled = !!data.link_running;
@@ -1530,6 +1578,14 @@ std::string makeIndexHtml() {
         `ratio4 ${num(data.metrics?.ratio_raw4).toFixed(2)}x ratio8 ${num(data.metrics?.ratio_raw8).toFixed(2)}x PSNR ${num(data.metrics?.psnr).toFixed(2)} dB`;
       document.getElementById('statFaces').textContent =
         `faces now ${num(data.faces_now).toFixed(0)} gathered ${num(data.faces_gathered).toFixed(0)} detector ${data.face_detector ? 'on' : 'off'}`;
+      document.getElementById('recvSyncStat').textContent =
+        `sync ${data.link_stats?.sync_locked ? 'locked' : 'searching'}`;
+      document.getElementById('recvFrameStat').textContent =
+        `frames rx ${num(data.link_stats?.frames_received).toFixed(0)}`;
+      document.getElementById('recvPayloadStat').textContent =
+        `payload ${num(data.link_stats?.effective_payload_kbps).toFixed(2)} kbps`;
+      document.getElementById('recvLossStat').textContent =
+        `dropped ${num(data.link_stats?.frames_dropped).toFixed(0)}`;
 
       renderMessages(data.messages || []);
       stateStore.cursor = Math.max(stateStore.cursor, num(data.latest_text_cursor));
@@ -1541,9 +1597,14 @@ std::string makeIndexHtml() {
       document.getElementById('feedRaw').src = `/api/v2/frame/raw.jpg?t=${ts}`;
       document.getElementById('feedSent').src = `/api/v2/frame/sent.jpg?t=${ts}`;
       document.getElementById('feedReceived').src = `/api/v2/frame/received.jpg?t=${ts}`;
+      document.getElementById('feedReceivedFocus').src = `/api/v2/frame/received.jpg?t=${ts}`;
     }
 
     function collectControl() {
+      const exportPath = relayPath(document.getElementById('relayExportAdvInput').value || document.getElementById('relayExportInput').value,
+                                   DEFAULT_RELAY_EXPORT_PATH);
+      const importPath = relayPath(document.getElementById('relayImportAdvInput').value || document.getElementById('relayImportInput').value,
+                                   DEFAULT_RELAY_IMPORT_PATH);
       return {
         mode: document.getElementById('modeSelect').value,
         resolution: document.getElementById('resSelect').value,
@@ -1560,8 +1621,8 @@ std::string makeIndexHtml() {
         serial_port: document.getElementById('serialPortInput').value,
         serial_baud: document.getElementById('serialBaudInput').value,
         node_alias: document.getElementById('aliasInput').value,
-        relay_export_path: document.getElementById('relayExportAdvInput').value || document.getElementById('relayExportInput').value,
-        relay_import_path: document.getElementById('relayImportAdvInput').value || document.getElementById('relayImportInput').value
+        relay_export_path: exportPath,
+        relay_import_path: importPath
       };
     }
 
@@ -1596,6 +1657,14 @@ std::string makeIndexHtml() {
       document.getElementById('recordBtn').onclick = async () => applyControl({ recording: !(stateStore.latest?.recording) });
       document.getElementById('exportRelayBtn').onclick = async () => applyControl({ export_relay: true });
       document.getElementById('importRelayBtn').onclick = async () => applyControl({ import_relay: true });
+      document.getElementById('useDefaultRelayPathsBtn').onclick = async () => {
+        document.getElementById('relayExportInput').value = DEFAULT_RELAY_EXPORT_PATH;
+        document.getElementById('relayImportInput').value = DEFAULT_RELAY_IMPORT_PATH;
+        document.getElementById('relayExportAdvInput').value = DEFAULT_RELAY_EXPORT_PATH;
+        document.getElementById('relayImportAdvInput').value = DEFAULT_RELAY_IMPORT_PATH;
+        stateStore.formDirty = true;
+        await applyControl({});
+      };
 
       async function sendText(text) {
         await postJson('/api/v2/messages/send', {
