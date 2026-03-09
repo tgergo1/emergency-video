@@ -4,13 +4,16 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -101,7 +104,7 @@ void AcousticAdapter::configure(const SessionConfig &session,
 
     modem_ = std::make_unique<MfskModem>(modemParamsFromSession(session_));
     receiver_ = std::make_unique<AcousticBurstReceiver>(*modem_);
-    receiver_->setEnergyThreshold(0.02F, 0.011F);
+    receiver_->setEnergyThreshold(thresholdStart_, thresholdEnd_);
 }
 
 TransportKind AcousticAdapter::kind() const {
@@ -116,6 +119,8 @@ bool AcousticAdapter::start(std::string &error) {
     }
 
     running_ = true;
+    ensureAudioDevices();
+    calibrateAmbientProfile();
     ensureAudioDevices();
     return true;
 }
@@ -162,6 +167,53 @@ void AcousticAdapter::ensureAudioDevices() {
     }
     if (!needPlayback && audioEngine_.playbackRunning()) {
         audioEngine_.stopPlayback();
+    }
+}
+
+void AcousticAdapter::calibrateAmbientProfile() {
+    if (!running_ || receiver_ == nullptr) {
+        return;
+    }
+
+    bool startedTempCapture = false;
+    if (!audioEngine_.captureRunning()) {
+        startedTempCapture = audioEngine_.startCapture(audioInDevice_, session_.sampleRate);
+        if (startedTempCapture) {
+            audioEngine_.clearCaptureBuffer();
+        }
+    } else {
+        audioEngine_.clearCaptureBuffer();
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+
+    std::vector<float> ambient;
+    const std::size_t maxSamples = std::max<std::size_t>(480, static_cast<std::size_t>(session_.sampleRate) * 7U / 10U);
+    audioEngine_.popCaptured(ambient, maxSamples);
+
+    double sumSq = 0.0;
+    for (float s : ambient) {
+        sumSq += static_cast<double>(s) * static_cast<double>(s);
+    }
+    noiseRms_ = ambient.empty() ? 0.0 : std::sqrt(sumSq / static_cast<double>(ambient.size()));
+
+    thresholdStart_ = std::max(0.008F, static_cast<float>(noiseRms_ * 5.0));
+    thresholdEnd_ = std::max(0.004F, static_cast<float>(noiseRms_ * 3.0));
+    receiver_->setEnergyThreshold(thresholdStart_, thresholdEnd_);
+
+    if (noiseRms_ < 0.003) {
+        session_.fecRepetition = 3;
+        session_.interleaveDepth = 8;
+    } else if (noiseRms_ < 0.012) {
+        session_.fecRepetition = 4;
+        session_.interleaveDepth = 10;
+    } else {
+        session_.fecRepetition = 5;
+        session_.interleaveDepth = 12;
+    }
+
+    if (startedTempCapture) {
+        audioEngine_.stopCapture();
     }
 }
 
@@ -240,19 +292,27 @@ void AcousticAdapter::pollIncoming(std::vector<std::vector<uint8_t>> &outEnvelop
     while (true) {
         std::vector<uint8_t> wire;
         std::size_t recoveredSymbols = 0;
-        if (!receiver_->popFrame(wire, &recoveredSymbols)) {
+        std::size_t comparedSymbols = 0;
+        if (!receiver_->popFrame(wire, &recoveredSymbols, &comparedSymbols)) {
             break;
         }
         stats_.framesReceived += 1;
         stats_.fecRecoveredCount += recoveredSymbols;
         stats_.syncLocked = true;
+        if (comparedSymbols > 0) {
+            const double sample = static_cast<double>(recoveredSymbols) / static_cast<double>(comparedSymbols);
+            stats_.berEstimate = (stats_.berEstimate <= 0.0) ? sample : (0.8 * stats_.berEstimate + 0.2 * sample);
+        }
         outEnvelopes.push_back(std::move(wire));
     }
 }
 
 std::string AcousticAdapter::status() const {
     std::ostringstream oss;
-    oss << "acoustic " << (running_ ? "running" : "stopped") << " txq=" << txRawFrames_.size();
+    oss << "acoustic " << (running_ ? "running" : "stopped") << " txq=" << txRawFrames_.size()
+        << " rms=" << std::fixed << std::setprecision(4) << noiseRms_
+        << " th=" << thresholdStart_ << "/" << thresholdEnd_
+        << " fec=" << static_cast<int>(session_.fecRepetition) << "/" << static_cast<int>(session_.interleaveDepth);
     return oss.str();
 }
 

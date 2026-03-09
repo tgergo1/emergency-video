@@ -82,22 +82,25 @@ std::string PersistentStore::makeBlobPath(uint64_t msgId, uint64_t tsMs, bool ou
 bool PersistentStore::persistOutbound(const CommEnvelopeHeader &header,
                                       const std::vector<uint8_t> &payload,
                                       bool relayable,
-                                      std::string &error) {
-    return persistInternal(header, payload, relayable, true, error);
+                                      std::string &error,
+                                      const EnvelopeAuthConfig *auth) {
+    return persistInternal(header, payload, relayable, true, error, auth);
 }
 
 bool PersistentStore::persistInbound(const CommEnvelopeHeader &header,
                                      const std::vector<uint8_t> &payload,
                                      bool relayable,
-                                     std::string &error) {
-    return persistInternal(header, payload, relayable, false, error);
+                                     std::string &error,
+                                     const EnvelopeAuthConfig *auth) {
+    return persistInternal(header, payload, relayable, false, error, auth);
 }
 
 bool PersistentStore::persistInternal(const CommEnvelopeHeader &header,
                                       const std::vector<uint8_t> &payload,
                                       bool relayable,
                                       bool outbound,
-                                      std::string &error) {
+                                      std::string &error,
+                                      const EnvelopeAuthConfig *auth) {
     error.clear();
     if (!relayable) {
         return true;
@@ -111,7 +114,7 @@ bool PersistentStore::persistInternal(const CommEnvelopeHeader &header,
         return false;
     }
 
-    const std::vector<uint8_t> envelope = serializeCommEnvelope(header, payload);
+    const std::vector<uint8_t> envelope = serializeCommEnvelope(header, payload, auth);
     out.write(reinterpret_cast<const char *>(envelope.data()), static_cast<std::streamsize>(envelope.size()));
     if (!out.good()) {
         error = "failed to write payload blob";

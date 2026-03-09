@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+
+#include "crypto.h"
 
 namespace {
 constexpr uint16_t kEnvelopeSync = 0xEA12;
 constexpr uint16_t kSessionSync = 0x52C1;
+constexpr std::size_t kEnvelopeAuthTagBytes = 16;
 
 void appendU8(std::vector<uint8_t> &out, uint8_t value) {
     out.push_back(value);
@@ -76,6 +80,39 @@ uint32_t fnv1a32(const std::vector<uint8_t> &bytes) {
         hash *= 16777619U;
     }
     return hash;
+}
+
+std::vector<uint8_t> serializeEnvelopeCore(CommEnvelopeHeader &header, const std::vector<uint8_t> &payload) {
+    header.protoVersion = kCommProtocolVersion;
+    header.payloadLen = static_cast<uint32_t>(payload.size());
+
+    std::vector<uint8_t> out;
+    out.reserve(96 + payload.size());
+    appendU16(out, kEnvelopeSync);
+    appendU8(out, header.protoVersion);
+    appendU8(out, static_cast<uint8_t>(header.payloadType));
+    appendU64(out, header.msgId);
+    appendU32(out, header.streamId);
+    appendU64(out, header.senderNodeId);
+    appendU8(out, static_cast<uint8_t>(header.targetScope));
+    appendU64(out, header.targetNodeId);
+    appendU32(out, header.seq);
+    appendU16(out, header.fragIndex);
+    appendU16(out, header.fragCount);
+    appendU64(out, header.timestampMs);
+    appendU32(out, header.ttlMs);
+    appendU32(out, header.payloadLen);
+    const std::size_t crcOffset = out.size();
+    appendU32(out, 0U);
+    out.insert(out.end(), payload.begin(), payload.end());
+
+    const uint32_t crc = crc32Comm(out.data(), out.size());
+    header.crc32 = crc;
+    out[crcOffset + 0] = static_cast<uint8_t>(crc & 0xFFU);
+    out[crcOffset + 1] = static_cast<uint8_t>((crc >> 8U) & 0xFFU);
+    out[crcOffset + 2] = static_cast<uint8_t>((crc >> 16U) & 0xFFU);
+    out[crcOffset + 3] = static_cast<uint8_t>((crc >> 24U) & 0xFFU);
+    return out;
 }
 
 } // namespace
@@ -152,7 +189,10 @@ uint32_t crc32Comm(const std::vector<uint8_t> &data) {
     return crc32Comm(data.data(), data.size());
 }
 
-uint32_t computeSessionConfigV2Hash(const SessionConfigV2 &config) {
+uint32_t computeSessionConfigV2Hash(const SessionConfigV2 &configIn) {
+    SessionConfigV2 config = configIn;
+    config.version = 3;
+
     std::vector<uint8_t> bytes;
     bytes.reserve(64);
     appendU8(bytes, config.version);
@@ -176,6 +216,7 @@ uint32_t computeSessionConfigV2Hash(const SessionConfigV2 &config) {
 }
 
 std::vector<uint8_t> serializeSessionConfigV2(SessionConfigV2 config) {
+    config.version = 3;
     config.configHash = computeSessionConfigV2Hash(config);
 
     std::vector<uint8_t> out;
@@ -219,11 +260,16 @@ bool deserializeSessionConfigV2(const std::vector<uint8_t> &bytes, SessionConfig
         error = "invalid session sync";
         return false;
     }
-    if (!readU8(bytes, off, config.version) || !readU32(bytes, off, config.streamId) || !readU16(bytes, off, config.configVersion) ||
-        !readU8(bytes, off, b)) {
+    if (!readU8(bytes, off, config.version) || !readU32(bytes, off, config.streamId) ||
+        !readU16(bytes, off, config.configVersion) || !readU8(bytes, off, b)) {
         error = "invalid session header";
         return false;
     }
+    if (config.version != 3) {
+        error = "unsupported session version";
+        return false;
+    }
+
     config.codecMode = (b == 0) ? CodecMode::Safer : CodecMode::Aggressive;
 
     if (!readU16(bytes, off, config.width) || !readU16(bytes, off, config.height) || !readU8(bytes, off, config.blockSize) ||
@@ -238,24 +284,27 @@ bool deserializeSessionConfigV2(const std::vector<uint8_t> &bytes, SessionConfig
         return false;
     }
     config.enableAcoustic = b != 0;
+
     if (!readU8(bytes, off, b)) {
         error = "invalid serial flag";
         return false;
     }
     config.enableSerial = b != 0;
+
     if (!readU8(bytes, off, b)) {
         error = "invalid optical flag";
         return false;
     }
     config.enableOptical = b != 0;
+
     if (!readU8(bytes, off, b)) {
         error = "invalid file relay flag";
         return false;
     }
     config.enableFileRelay = b != 0;
 
-    if (!readU32(bytes, off, config.reliableRetryMs) || !readU8(bytes, off, config.reliableMaxRetries) || !readU8(bytes, off, b) ||
-        !readU32(bytes, off, config.configHash)) {
+    if (!readU32(bytes, off, config.reliableRetryMs) || !readU8(bytes, off, config.reliableMaxRetries) ||
+        !readU8(bytes, off, b) || !readU32(bytes, off, config.configHash)) {
         error = "invalid session reliability section";
         return false;
     }
@@ -368,93 +417,132 @@ bool deserializeSnapshotPayload(const std::vector<uint8_t> &bytes,
     return true;
 }
 
-std::vector<uint8_t> serializeCommEnvelope(const CommEnvelopeHeader &headerIn, const std::vector<uint8_t> &payload) {
-    CommEnvelopeHeader header = headerIn;
-    header.payloadLen = static_cast<uint32_t>(payload.size());
-
+std::vector<uint8_t> serializeTransportProbePayload(const TransportProbePayload &probe) {
     std::vector<uint8_t> out;
-    out.reserve(96 + payload.size());
-    appendU16(out, kEnvelopeSync);
-    appendU8(out, header.protoVersion);
-    appendU8(out, static_cast<uint8_t>(header.payloadType));
-    appendU64(out, header.msgId);
-    appendU32(out, header.streamId);
-    appendU64(out, header.senderNodeId);
-    appendU8(out, static_cast<uint8_t>(header.targetScope));
-    appendU64(out, header.targetNodeId);
-    appendU32(out, header.seq);
-    appendU16(out, header.fragIndex);
-    appendU16(out, header.fragCount);
-    appendU64(out, header.timestampMs);
-    appendU32(out, header.ttlMs);
-    appendU32(out, header.payloadLen);
-    const std::size_t crcOffset = out.size();
-    appendU32(out, 0U); // placeholder crc
-    out.insert(out.end(), payload.begin(), payload.end());
+    out.reserve(24);
+    appendU64(out, probe.probeId);
+    appendU8(out, static_cast<uint8_t>(probe.kind));
+    appendU64(out, probe.sentTsMs);
+    return out;
+}
 
-    const uint32_t crc = crc32Comm(out.data(), out.size());
-    out[crcOffset + 0] = static_cast<uint8_t>(crc & 0xFFU);
-    out[crcOffset + 1] = static_cast<uint8_t>((crc >> 8U) & 0xFFU);
-    out[crcOffset + 2] = static_cast<uint8_t>((crc >> 16U) & 0xFFU);
-    out[crcOffset + 3] = static_cast<uint8_t>((crc >> 24U) & 0xFFU);
+bool deserializeTransportProbePayload(const std::vector<uint8_t> &bytes,
+                                      TransportProbePayload &probe,
+                                      std::string &error) {
+    error.clear();
+    std::size_t off = 0;
+    uint8_t kind = 0;
+    if (!readU64(bytes, off, probe.probeId) || !readU8(bytes, off, kind) || !readU64(bytes, off, probe.sentTsMs) ||
+        off != bytes.size()) {
+        error = "invalid transport probe payload";
+        return false;
+    }
+    if (kind > static_cast<uint8_t>(ProbeKind::Pong)) {
+        error = "invalid probe kind";
+        return false;
+    }
+    probe.kind = static_cast<ProbeKind>(kind);
+    return true;
+}
+
+std::vector<uint8_t> serializeCommEnvelope(const CommEnvelopeHeader &headerIn,
+                                           const std::vector<uint8_t> &payload,
+                                           const EnvelopeAuthConfig *auth) {
+    CommEnvelopeHeader header = headerIn;
+    std::vector<uint8_t> out = serializeEnvelopeCore(header, payload);
+
+    if (auth != nullptr && auth->enabled) {
+        const Sha256Digest tag = hmacSha256(auth->key.data(), auth->key.size(), out.data(), out.size());
+        out.insert(out.end(), tag.begin(), tag.begin() + static_cast<std::ptrdiff_t>(kEnvelopeAuthTagBytes));
+    }
+
     return out;
 }
 
 bool deserializeCommEnvelope(const std::vector<uint8_t> &bytes,
                              CommEnvelopeHeader &header,
                              std::vector<uint8_t> &payload,
-                             std::string &error) {
+                             std::string &error,
+                             const EnvelopeAuthConfig *auth,
+                             bool *authFailure) {
     error.clear();
     payload.clear();
+    if (authFailure != nullptr) {
+        *authFailure = false;
+    }
 
-    if (bytes.size() < 45) {
+    const bool authEnabled = (auth != nullptr && auth->enabled);
+    const std::size_t minSize = 45 + (authEnabled ? kEnvelopeAuthTagBytes : 0U);
+    if (bytes.size() < minSize) {
         error = "envelope too short";
         return false;
     }
 
-    const std::vector<uint8_t> copy = bytes;
     std::size_t off = 0;
     uint16_t sync = 0;
     uint8_t payloadType = 0;
 
-    if (!readU16(copy, off, sync) || sync != kEnvelopeSync) {
+    if (!readU16(bytes, off, sync) || sync != kEnvelopeSync) {
         error = "invalid envelope sync";
         return false;
     }
-    if (!readU8(copy, off, header.protoVersion) || !readU8(copy, off, payloadType) || !readU64(copy, off, header.msgId) ||
-        !readU32(copy, off, header.streamId) || !readU64(copy, off, header.senderNodeId)) {
+
+    if (!readU8(bytes, off, header.protoVersion) || !readU8(bytes, off, payloadType) || !readU64(bytes, off, header.msgId) ||
+        !readU32(bytes, off, header.streamId) || !readU64(bytes, off, header.senderNodeId)) {
         error = "invalid envelope base header";
         return false;
     }
+
+    if (header.protoVersion != kCommProtocolVersion) {
+        error = "unsupported envelope version";
+        return false;
+    }
+
     header.payloadType = static_cast<CommPayloadType>(payloadType);
 
     uint8_t scope = 0;
-    if (!readU8(copy, off, scope) || !readU64(copy, off, header.targetNodeId) || !readU32(copy, off, header.seq) ||
-        !readU16(copy, off, header.fragIndex) || !readU16(copy, off, header.fragCount) || !readU64(copy, off, header.timestampMs) ||
-        !readU32(copy, off, header.ttlMs) || !readU32(copy, off, header.payloadLen) || !readU32(copy, off, header.crc32)) {
+    if (!readU8(bytes, off, scope) || !readU64(bytes, off, header.targetNodeId) || !readU32(bytes, off, header.seq) ||
+        !readU16(bytes, off, header.fragIndex) || !readU16(bytes, off, header.fragCount) || !readU64(bytes, off, header.timestampMs) ||
+        !readU32(bytes, off, header.ttlMs) || !readU32(bytes, off, header.payloadLen) || !readU32(bytes, off, header.crc32)) {
         error = "invalid envelope extended header";
         return false;
     }
     header.targetScope = (scope == 0U) ? TargetScope::Broadcast : TargetScope::Direct;
 
-    if (off + header.payloadLen != copy.size()) {
+    const std::size_t coreSize = off + header.payloadLen;
+    const std::size_t expectedSize = coreSize + (authEnabled ? kEnvelopeAuthTagBytes : 0U);
+    if (expectedSize != bytes.size()) {
         error = "envelope payload length mismatch";
         return false;
     }
 
+    std::vector<uint8_t> crcBuf(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(coreSize));
     const std::size_t crcOffset = off - 4;
-    std::vector<uint8_t> crcBuf = copy;
     crcBuf[crcOffset + 0] = 0;
     crcBuf[crcOffset + 1] = 0;
     crcBuf[crcOffset + 2] = 0;
     crcBuf[crcOffset + 3] = 0;
+
     const uint32_t crc = crc32Comm(crcBuf.data(), crcBuf.size());
     if (crc != header.crc32) {
         error = "envelope crc mismatch";
         return false;
     }
 
-    payload.assign(copy.begin() + static_cast<std::ptrdiff_t>(off), copy.end());
+    if (authEnabled) {
+        const Sha256Digest tag = hmacSha256(auth->key.data(), auth->key.size(), bytes.data(), coreSize);
+        const uint8_t *provided = bytes.data() + static_cast<std::ptrdiff_t>(coreSize);
+        if (std::memcmp(tag.data(), provided, kEnvelopeAuthTagBytes) != 0) {
+            if (authFailure != nullptr) {
+                *authFailure = true;
+            }
+            error = "envelope auth mismatch";
+            return false;
+        }
+    }
+
+    payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(off),
+                   bytes.begin() + static_cast<std::ptrdiff_t>(off + header.payloadLen));
     return true;
 }
 

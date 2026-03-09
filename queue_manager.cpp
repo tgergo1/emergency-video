@@ -37,7 +37,6 @@ void QueueManager::reset() {
     textQ_.clear();
     snapshotQ_.clear();
     videoQ_.clear();
-    inFlightReliable_.clear();
     dedupOrder_.clear();
     dedupSet_.clear();
     dropped_ = 0;
@@ -81,61 +80,6 @@ bool QueueManager::popNext(QueuedEnvelope &item) {
     return popFrom(videoQ_);
 }
 
-void QueueManager::markSent(uint64_t msgId, std::chrono::steady_clock::time_point ts) {
-    auto it = inFlightReliable_.find(msgId);
-    if (it != inFlightReliable_.end()) {
-        it->second.lastSend = ts;
-        return;
-    }
-}
-
-void QueueManager::markAcked(uint64_t msgId) {
-    inFlightReliable_.erase(msgId);
-}
-
-std::vector<QueuedEnvelope> QueueManager::collectRetries(std::chrono::steady_clock::time_point now,
-                                                         uint32_t retryMs,
-                                                         uint8_t maxRetries,
-                                                         std::size_t maxCount) {
-    std::vector<QueuedEnvelope> retries;
-    retries.reserve(maxCount);
-
-    const auto retryDelay = std::chrono::milliseconds(std::max<uint32_t>(100, retryMs));
-
-    for (auto &entry : inFlightReliable_) {
-        QueuedEnvelope &inFlight = entry.second;
-        if (retries.size() >= maxCount) {
-            break;
-        }
-        if (inFlight.lastSend.time_since_epoch().count() == 0) {
-            continue;
-        }
-        if (now - inFlight.lastSend < retryDelay) {
-            continue;
-        }
-        if (inFlight.retries >= maxRetries) {
-            ++dropped_;
-            continue;
-        }
-        ++inFlight.retries;
-        inFlight.lastSend = now;
-        retries.push_back(inFlight);
-    }
-
-    // Erase permanently failed after iteration.
-    std::vector<uint64_t> toErase;
-    for (const auto &entry : inFlightReliable_) {
-        if (entry.second.retries >= maxRetries) {
-            toErase.push_back(entry.first);
-        }
-    }
-    for (uint64_t msgId : toErase) {
-        inFlightReliable_.erase(msgId);
-    }
-
-    return retries;
-}
-
 bool QueueManager::isDuplicate(uint64_t senderNodeId, uint64_t msgId) {
     const std::pair<uint64_t, uint64_t> key{senderNodeId, msgId};
     if (dedupSet_.find(key) != dedupSet_.end()) {
@@ -158,7 +102,6 @@ QueueStats QueueManager::stats() const {
     out.queuedText = textQ_.size();
     out.queuedSnapshot = snapshotQ_.size();
     out.queuedVideo = videoQ_.size();
-    out.inFlightReliable = inFlightReliable_.size();
     out.dropped = dropped_;
     return out;
 }

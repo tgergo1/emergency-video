@@ -27,7 +27,8 @@ public:
 
     bool demodulateBurst(const std::vector<float> &segment,
                          std::vector<uint8_t> &rawFrame,
-                         std::size_t *recoveredSymbols = nullptr) const;
+                         std::size_t *recoveredSymbols = nullptr,
+                         std::size_t *comparedSymbols = nullptr) const;
 
 private:
     ModemParams params_;
@@ -44,7 +45,9 @@ public:
     void setEnergyThreshold(float thresholdStart, float thresholdEnd);
     void feedSamples(const float *samples, std::size_t count);
 
-    bool popFrame(std::vector<uint8_t> &rawFrame, std::size_t *recoveredSymbols = nullptr);
+    bool popFrame(std::vector<uint8_t> &rawFrame,
+                  std::size_t *recoveredSymbols = nullptr,
+                  std::size_t *comparedSymbols = nullptr);
     void clear();
 
 private:
@@ -65,4 +68,3 @@ private:
 std::vector<std::vector<uint8_t>> demodulatePcmBuffer(const std::vector<float> &pcm,
                                                        const MfskModem &modem,
                                                        LinkStats *stats = nullptr);
-

@@ -89,6 +89,8 @@ add_executable(emergency_video
     transport_manager.cpp
     acoustic_link.cpp
     acoustic_modem.cpp
+    fallback_controller.cpp
+    crypto.cpp
     audio_io.cpp
     media_ffmpeg.cpp
     third_party/miniaudio.c
@@ -251,6 +253,10 @@ if(EV_BUILD_TESTS)
         queue_manager.cpp
         router.cpp
         persistent_store.cpp
+        acoustic_link.cpp
+        acoustic_modem.cpp
+        fallback_controller.cpp
+        crypto.cpp
     )
     target_include_directories(emergency_video_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     if(MSVC)

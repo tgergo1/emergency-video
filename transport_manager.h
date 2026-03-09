@@ -71,8 +71,12 @@ private:
 
     bool running_ = false;
     LinkStats stats_;
+    float thresholdStart_ = 0.02F;
+    float thresholdEnd_ = 0.011F;
+    double noiseRms_ = 0.0;
 
     void ensureAudioDevices();
+    void calibrateAmbientProfile();
     void maybeFeedMediaFile();
 };
 

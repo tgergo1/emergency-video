@@ -101,6 +101,13 @@ struct LinkStats {
     uint64_t retransmitCount = 0;
     double rttMs = 0.0;
     double effectivePayloadKbps = 0.0;
+    uint64_t transportFramesIn = 0;
+    uint64_t transportFramesDropped = 0;
+    double transportLossPercent = 0.0;
+    uint64_t authFailures = 0;
+    uint64_t probeSent = 0;
+    uint64_t probeAcked = 0;
+    double probeLossPercent = 0.0;
 };
 
 struct AckPacket {
@@ -145,7 +152,8 @@ bool fecRecover(const std::vector<uint8_t> &encoded,
                 uint8_t repetition,
                 uint8_t interleaveDepth,
                 std::vector<uint8_t> &decoded,
-                std::size_t *recoveredSymbols = nullptr);
+                std::size_t *recoveredSymbols = nullptr,
+                std::size_t *comparedSymbols = nullptr);
 
 class FragmentReassembler {
 public:
@@ -172,4 +180,3 @@ private:
 bool isTxSlotNow(const SessionConfig &config,
                  std::chrono::steady_clock::time_point now,
                  bool senderRole);
-

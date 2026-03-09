@@ -39,8 +39,9 @@ RouterOutgoing Router::makeOutgoing(CommPayloadType payloadType,
                                     uint64_t forceMsgId) {
     RouterOutgoing out;
     out.reliable = reliable;
+    out.isRetry = false;
     out.payload = std::move(payload);
-    out.header.protoVersion = 1;
+    out.header.protoVersion = kCommProtocolVersion;
     out.header.payloadType = payloadType;
     out.header.msgId = (forceMsgId == 0) ? nextMsgId() : forceMsgId;
     out.header.senderNodeId = identity_.nodeId;
@@ -119,6 +120,17 @@ uint64_t Router::enqueueSnapshot(const SnapshotMessage &snapshot, uint32_t ttlMs
                                       true,
                                       send.msgId);
     queue_.enqueue(out.header, out.payload, out.reliable);
+
+    TextMessage local;
+    local.msgId = out.header.msgId;
+    local.senderNodeId = identity_.nodeId;
+    local.targetNodeId = 0;
+    local.targetScope = TargetScope::Broadcast;
+    local.timestampMs = out.header.timestampMs;
+    local.state = DeliveryState::Queued;
+    local.body = "[snapshot " + std::to_string(send.width) + "x" + std::to_string(send.height) + "]";
+    pushTimeline(std::move(local));
+
     return out.header.msgId;
 }
 
@@ -134,6 +146,20 @@ uint64_t Router::enqueueVideoFrame(const std::vector<uint8_t> &codecPayload,
     if (keyframe) {
         out.header.ttlMs = std::max<uint32_t>(ttlMs, 22000);
     }
+    queue_.enqueue(out.header, out.payload, out.reliable);
+    return out.header.msgId;
+}
+
+uint64_t Router::enqueueTransportProbe(const TransportProbePayload &probe,
+                                       TargetScope scope,
+                                       uint64_t targetNodeId,
+                                       uint32_t ttlMs) {
+    RouterOutgoing out = makeOutgoing(CommPayloadType::TransportProbe,
+                                      serializeTransportProbePayload(probe),
+                                      scope,
+                                      targetNodeId,
+                                      ttlMs,
+                                      false);
     queue_.enqueue(out.header, out.payload, out.reliable);
     return out.header.msgId;
 }
@@ -161,7 +187,9 @@ std::vector<RouterOutgoing> Router::collectOutgoing(std::size_t budget,
         if (age >= static_cast<long long>(retryMs)) {
             entry.lastSend = now;
             entry.retries += 1;
-            out.push_back(entry.packet);
+            RouterOutgoing retryPacket = entry.packet;
+            retryPacket.isRetry = true;
+            out.push_back(std::move(retryPacket));
         }
         ++it;
     }
@@ -172,6 +200,7 @@ std::vector<RouterOutgoing> Router::collectOutgoing(std::size_t budget,
         send.header = item.header;
         send.payload = std::move(item.payload);
         send.reliable = item.reliable || shouldBeReliable(send.header.payloadType);
+        send.isRetry = false;
         send.header.seq = nextSeq_++;
         send.header.timestampMs = nowUnixMs();
         send.header.fragIndex = 0;
@@ -198,13 +227,15 @@ std::vector<RouterOutgoing> Router::collectOutgoing(std::size_t budget,
 }
 
 RouterEvents Router::processIncomingEnvelope(const std::vector<uint8_t> &envelopeBytes,
-                                             std::chrono::steady_clock::time_point /*now*/) {
+                                             std::chrono::steady_clock::time_point /*now*/,
+                                             const EnvelopeAuthConfig *auth) {
     RouterEvents events;
 
     CommEnvelopeHeader header;
     std::vector<uint8_t> payload;
     std::string error;
-    if (!deserializeCommEnvelope(envelopeBytes, header, payload, error)) {
+    bool authFailed = false;
+    if (!deserializeCommEnvelope(envelopeBytes, header, payload, error, auth, &authFailed)) {
         return events;
     }
 
@@ -272,6 +303,16 @@ RouterEvents Router::processIncomingEnvelope(const std::vector<uint8_t> &envelop
             in.snapshot.senderNodeId = header.senderNodeId;
             in.snapshot.timestampMs = header.timestampMs;
             events.snapshots.push_back(std::move(in));
+
+            TextMessage meta;
+            meta.msgId = header.msgId;
+            meta.senderNodeId = header.senderNodeId;
+            meta.targetNodeId = header.targetNodeId;
+            meta.targetScope = header.targetScope;
+            meta.timestampMs = header.timestampMs;
+            meta.state = DeliveryState::Relayed;
+            meta.body = "[snapshot " + std::to_string(header.payloadLen) + " bytes]";
+            pushTimeline(std::move(meta));
         }
         return events;
     }
@@ -281,6 +322,33 @@ RouterEvents Router::processIncomingEnvelope(const std::vector<uint8_t> &envelop
     }
 
     if (header.payloadType == CommPayloadType::Config) {
+        return events;
+    }
+
+    if (header.payloadType == CommPayloadType::TransportProbe) {
+        TransportProbePayload probe;
+        if (!deserializeTransportProbePayload(payload, probe, error)) {
+            return events;
+        }
+
+        RouterIncomingProbe in;
+        in.header = header;
+        in.probe = probe;
+        events.probes.push_back(in);
+
+        if (probe.kind == ProbeKind::Ping && header.senderNodeId != identity_.nodeId) {
+            TransportProbePayload pong;
+            pong.probeId = probe.probeId;
+            pong.kind = ProbeKind::Pong;
+            pong.sentTsMs = probe.sentTsMs;
+            RouterOutgoing pongOut = makeOutgoing(CommPayloadType::TransportProbe,
+                                                  serializeTransportProbePayload(pong),
+                                                  TargetScope::Direct,
+                                                  header.senderNodeId,
+                                                  10000,
+                                                  false);
+            queue_.enqueue(pongOut.header, pongOut.payload, pongOut.reliable);
+        }
         return events;
     }
 

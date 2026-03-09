@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -29,6 +30,11 @@ enum class TargetScope : uint8_t {
     Direct = 1,
 };
 
+enum class ProbeKind : uint8_t {
+    Ping = 0,
+    Pong = 1,
+};
+
 enum class DeliveryState : uint8_t {
     Queued = 0,
     Sent = 1,
@@ -50,8 +56,15 @@ struct NodeIdentity {
     std::string alias;
 };
 
+constexpr uint8_t kCommProtocolVersion = 3;
+
+struct EnvelopeAuthConfig {
+    bool enabled = false;
+    std::array<uint8_t, 32> key{};
+};
+
 struct CommEnvelopeHeader {
-    uint8_t protoVersion = 1;
+    uint8_t protoVersion = kCommProtocolVersion;
     CommPayloadType payloadType = CommPayloadType::VideoFrame;
     uint64_t msgId = 0;
     uint32_t streamId = 0;
@@ -108,7 +121,7 @@ struct RelayRecord {
 };
 
 struct SessionConfigV2 {
-    uint8_t version = 2;
+    uint8_t version = 3;
     uint32_t streamId = 0;
     uint16_t configVersion = 1;
 
@@ -135,6 +148,12 @@ struct SessionConfigV2 {
 
 struct AckPayload {
     uint64_t ackMsgId = 0;
+};
+
+struct TransportProbePayload {
+    uint64_t probeId = 0;
+    ProbeKind kind = ProbeKind::Ping;
+    uint64_t sentTsMs = 0;
 };
 
 const char *transportKindName(TransportKind kind);
@@ -164,10 +183,19 @@ bool deserializeSnapshotPayload(const std::vector<uint8_t> &bytes,
                                 SnapshotMessage &snapshot,
                                 std::string &error);
 
-std::vector<uint8_t> serializeCommEnvelope(const CommEnvelopeHeader &header, const std::vector<uint8_t> &payload);
+std::vector<uint8_t> serializeTransportProbePayload(const TransportProbePayload &probe);
+bool deserializeTransportProbePayload(const std::vector<uint8_t> &bytes,
+                                      TransportProbePayload &probe,
+                                      std::string &error);
+
+std::vector<uint8_t> serializeCommEnvelope(const CommEnvelopeHeader &header,
+                                           const std::vector<uint8_t> &payload,
+                                           const EnvelopeAuthConfig *auth = nullptr);
 bool deserializeCommEnvelope(const std::vector<uint8_t> &bytes,
                              CommEnvelopeHeader &header,
                              std::vector<uint8_t> &payload,
-                             std::string &error);
+                             std::string &error,
+                             const EnvelopeAuthConfig *auth = nullptr,
+                             bool *authFailure = nullptr);
 
 std::vector<std::vector<uint8_t>> fragmentCommPayload(const std::vector<uint8_t> &payload, std::size_t maxFragmentBytes);

@@ -14,6 +14,7 @@ struct RouterOutgoing {
     CommEnvelopeHeader header;
     std::vector<uint8_t> payload;
     bool reliable = false;
+    bool isRetry = false;
 };
 
 struct RouterIncomingVideo {
@@ -31,10 +32,16 @@ struct RouterIncomingText {
     TextMessage text;
 };
 
+struct RouterIncomingProbe {
+    CommEnvelopeHeader header;
+    TransportProbePayload probe;
+};
+
 struct RouterEvents {
     std::vector<RouterIncomingVideo> videoFrames;
     std::vector<RouterIncomingSnapshot> snapshots;
     std::vector<RouterIncomingText> texts;
+    std::vector<RouterIncomingProbe> probes;
 };
 
 class Router {
@@ -53,6 +60,10 @@ public:
     uint64_t enqueueVideoFrame(const std::vector<uint8_t> &codecPayload,
                                bool keyframe,
                                uint32_t ttlMs = 12000);
+    uint64_t enqueueTransportProbe(const TransportProbePayload &probe,
+                                   TargetScope scope,
+                                   uint64_t targetNodeId,
+                                   uint32_t ttlMs = 12000);
 
     std::vector<RouterOutgoing> collectOutgoing(std::size_t budget,
                                                 std::chrono::steady_clock::time_point now,
@@ -60,7 +71,8 @@ public:
                                                 uint8_t maxRetries);
 
     RouterEvents processIncomingEnvelope(const std::vector<uint8_t> &envelopeBytes,
-                                         std::chrono::steady_clock::time_point now);
+                                         std::chrono::steady_clock::time_point now,
+                                         const EnvelopeAuthConfig *auth = nullptr);
 
     [[nodiscard]] QueueStats queueStats() const;
     [[nodiscard]] std::vector<TextMessage> timelineAfter(uint64_t msgIdCursor, std::size_t limit) const;

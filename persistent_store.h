@@ -17,11 +17,13 @@ public:
     bool persistOutbound(const CommEnvelopeHeader &header,
                          const std::vector<uint8_t> &payload,
                          bool relayable,
-                         std::string &error);
+                         std::string &error,
+                         const EnvelopeAuthConfig *auth = nullptr);
     bool persistInbound(const CommEnvelopeHeader &header,
                         const std::vector<uint8_t> &payload,
                         bool relayable,
-                        std::string &error);
+                        std::string &error,
+                        const EnvelopeAuthConfig *auth = nullptr);
 
     bool exportRelayBundle(const std::string &outputPath,
                            std::size_t maxRecords,
@@ -45,6 +47,7 @@ private:
                          const std::vector<uint8_t> &payload,
                          bool relayable,
                          bool outbound,
-                         std::string &error);
+                         std::string &error,
+                         const EnvelopeAuthConfig *auth);
     std::string makeBlobPath(uint64_t msgId, uint64_t tsMs, bool outbound) const;
 };

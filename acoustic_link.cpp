@@ -512,10 +512,14 @@ bool fecRecover(const std::vector<uint8_t> &encoded,
                 uint8_t repetition,
                 uint8_t interleaveDepth,
                 std::vector<uint8_t> &decoded,
-                std::size_t *recoveredSymbols) {
+                std::size_t *recoveredSymbols,
+                std::size_t *comparedSymbols) {
     decoded.clear();
     if (recoveredSymbols != nullptr) {
         *recoveredSymbols = 0;
+    }
+    if (comparedSymbols != nullptr) {
+        *comparedSymbols = 0;
     }
 
     const uint8_t rep = std::clamp<uint8_t>(repetition, 1, 5);
@@ -564,6 +568,9 @@ bool fecRecover(const std::vector<uint8_t> &encoded,
                 }
             }
             *recoveredSymbols += static_cast<std::size_t>(disagreements);
+        }
+        if (comparedSymbols != nullptr) {
+            *comparedSymbols += static_cast<std::size_t>(rep);
         }
     }
 

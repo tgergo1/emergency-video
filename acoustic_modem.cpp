@@ -124,7 +124,8 @@ std::vector<uint8_t> decodeSymbolsAtOffset(const std::vector<float> &segment,
 
 bool parseWirePayload(const std::vector<uint8_t> &wire,
                       std::vector<uint8_t> &rawFrame,
-                      std::size_t *recoveredSymbols) {
+                      std::size_t *recoveredSymbols,
+                      std::size_t *comparedSymbols) {
     if (wire.size() < 12 || wire[0] != kWireMagicA || wire[1] != kWireMagicB) {
         return false;
     }
@@ -163,13 +164,17 @@ bool parseWirePayload(const std::vector<uint8_t> &wire,
 
     std::vector<uint8_t> decoded;
     std::size_t recovered = 0;
-    if (!fecRecover(encoded, rawSize, repetition, interleave, decoded, &recovered)) {
+    std::size_t compared = 0;
+    if (!fecRecover(encoded, rawSize, repetition, interleave, decoded, &recovered, &compared)) {
         return false;
     }
 
     rawFrame = std::move(decoded);
     if (recoveredSymbols != nullptr) {
         *recoveredSymbols = recovered;
+    }
+    if (comparedSymbols != nullptr) {
+        *comparedSymbols = compared;
     }
 
     return true;
@@ -274,36 +279,45 @@ std::vector<float> MfskModem::modulateFrame(const std::vector<uint8_t> &rawFrame
 
 bool MfskModem::demodulateBurst(const std::vector<float> &segment,
                                 std::vector<uint8_t> &rawFrame,
-                                std::size_t *recoveredSymbols) const {
+                                std::size_t *recoveredSymbols,
+                                std::size_t *comparedSymbols) const {
     rawFrame.clear();
     if (segment.size() < static_cast<std::size_t>(params_.symbolSamples) * (preambleSymbols_.size() + 10U)) {
         return false;
     }
 
-    const std::size_t step = std::max<std::size_t>(1, params_.symbolSamples / 6);
-    const std::size_t maxOffset = std::min<std::size_t>(params_.symbolSamples, segment.size() / 2);
+    const std::size_t nominal = params_.symbolSamples;
+    const std::size_t low = std::max<std::size_t>(32, static_cast<std::size_t>(std::llround(nominal * 0.94)));
+    const std::size_t high = std::max<std::size_t>(32, static_cast<std::size_t>(std::llround(nominal * 1.06)));
+    const std::array<std::size_t, 3> symbolCandidates = {nominal, low, high};
 
     std::size_t bestOffset = 0;
+    std::size_t bestSymbolSamples = nominal;
     int bestScore = -1;
-    for (std::size_t offset = 0; offset < maxOffset; offset += step) {
-        const std::vector<uint8_t> symbols = decodeSymbolsAtOffset(segment,
-                                                                    offset,
-                                                                    params_.symbolSamples,
-                                                                    frequencies_,
-                                                                    params_.sampleRate,
-                                                                    preambleSymbols_.size());
-        if (symbols.size() < preambleSymbols_.size()) {
-            continue;
-        }
-        int score = 0;
-        for (std::size_t i = 0; i < preambleSymbols_.size(); ++i) {
-            if (symbols[i] == (preambleSymbols_[i] % params_.bins)) {
-                ++score;
+    for (std::size_t symbolSamples : symbolCandidates) {
+        const std::size_t step = std::max<std::size_t>(1, symbolSamples / 6);
+        const std::size_t maxOffset = std::min<std::size_t>(symbolSamples, segment.size() / 2);
+        for (std::size_t offset = 0; offset < maxOffset; offset += step) {
+            const std::vector<uint8_t> symbols = decodeSymbolsAtOffset(segment,
+                                                                        offset,
+                                                                        symbolSamples,
+                                                                        frequencies_,
+                                                                        params_.sampleRate,
+                                                                        preambleSymbols_.size());
+            if (symbols.size() < preambleSymbols_.size()) {
+                continue;
             }
-        }
-        if (score > bestScore) {
-            bestScore = score;
-            bestOffset = offset;
+            int score = 0;
+            for (std::size_t i = 0; i < preambleSymbols_.size(); ++i) {
+                if (symbols[i] == (preambleSymbols_[i] % params_.bins)) {
+                    ++score;
+                }
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                bestOffset = offset;
+                bestSymbolSamples = symbolSamples;
+            }
         }
     }
 
@@ -313,10 +327,10 @@ bool MfskModem::demodulateBurst(const std::vector<float> &segment,
 
     const std::vector<uint8_t> allSymbols = decodeSymbolsAtOffset(segment,
                                                                    bestOffset,
-                                                                   params_.symbolSamples,
+                                                                   bestSymbolSamples,
                                                                    frequencies_,
                                                                    params_.sampleRate,
-                                                                   segment.size() / params_.symbolSamples);
+                                                                   segment.size() / bestSymbolSamples);
     if (allSymbols.size() <= preambleSymbols_.size()) {
         return false;
     }
@@ -329,7 +343,22 @@ bool MfskModem::demodulateBurst(const std::vector<float> &segment,
         return false;
     }
 
-    return parseWirePayload(wire, rawFrame, recoveredSymbols);
+    if (parseWirePayload(wire, rawFrame, recoveredSymbols, comparedSymbols)) {
+        return true;
+    }
+
+    // Burst segmentation can leave a few trailing symbols from silence/noise.
+    for (std::size_t cut = wire.size(); cut >= 12; --cut) {
+        std::vector<uint8_t> candidate(wire.begin(), wire.begin() + static_cast<std::ptrdiff_t>(cut));
+        if (parseWirePayload(candidate, rawFrame, recoveredSymbols, comparedSymbols)) {
+            return true;
+        }
+        if (cut == 12) {
+            break;
+        }
+    }
+
+    return false;
 }
 
 AcousticBurstReceiver::AcousticBurstReceiver(const MfskModem &modem) : modem_(modem) {
@@ -392,12 +421,14 @@ void AcousticBurstReceiver::extractSegments() {
     }
 }
 
-bool AcousticBurstReceiver::popFrame(std::vector<uint8_t> &rawFrame, std::size_t *recoveredSymbols) {
+bool AcousticBurstReceiver::popFrame(std::vector<uint8_t> &rawFrame,
+                                     std::size_t *recoveredSymbols,
+                                     std::size_t *comparedSymbols) {
     while (!pendingSegments_.empty()) {
         std::vector<float> segment = std::move(pendingSegments_.front());
         pendingSegments_.erase(pendingSegments_.begin());
 
-        if (modem_.demodulateBurst(segment, rawFrame, recoveredSymbols)) {
+        if (modem_.demodulateBurst(segment, rawFrame, recoveredSymbols, comparedSymbols)) {
             return true;
         }
     }
@@ -427,7 +458,8 @@ std::vector<std::vector<uint8_t>> demodulatePcmBuffer(const std::vector<float> &
         while (true) {
             std::vector<uint8_t> frame;
             std::size_t recovered = 0;
-            if (!rx.popFrame(frame, &recovered)) {
+            std::size_t compared = 0;
+            if (!rx.popFrame(frame, &recovered, &compared)) {
                 break;
             }
             out.push_back(std::move(frame));
@@ -435,6 +467,10 @@ std::vector<std::vector<uint8_t>> demodulatePcmBuffer(const std::vector<float> &
                 stats->syncLocked = true;
                 stats->framesReceived += 1;
                 stats->fecRecoveredCount += recovered;
+                if (compared > 0) {
+                    const double sample = static_cast<double>(recovered) / static_cast<double>(compared);
+                    stats->berEstimate = (stats->berEstimate <= 0.0) ? sample : (0.8 * stats->berEstimate + 0.2 * sample);
+                }
             }
         }
     }

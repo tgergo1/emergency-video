@@ -40,6 +40,8 @@
 #include "audio_io.h"
 #include "media_ffmpeg.h"
 #include "communicator_protocol.h"
+#include "crypto.h"
+#include "fallback_controller.h"
 #include "persistent_store.h"
 #include "router.h"
 #include "transport_manager.h"
@@ -128,9 +130,13 @@ struct ControlState {
     std::string nodeAlias = "Field-Unit";
     std::string relayExportPath = "./relay_out/export.evrelay";
     std::string relayImportPath;
+    bool authEnabled = false;
+    std::string authPin;
     std::string outgoingText;
     TargetScope outgoingTextScope = TargetScope::Broadcast;
     uint64_t outgoingTextTarget = 0;
+    bool sendSnapshot = false;
+    bool runLinkTest = false;
 
     bool forceNextKeyframe = false;
     bool rescanCameras = false;
@@ -196,6 +202,7 @@ struct SharedState {
     std::string relayImportPath;
     std::string nodeAlias = "Field-Unit";
     FallbackStage fallbackStage = FallbackStage::Normal;
+    bool authEnabled = false;
     QueueStats queueStats{};
     std::vector<TextMessage> messages;
     uint64_t latestTextCursor = 0;
@@ -944,6 +951,7 @@ std::string buildStateJson(const SharedState &state) {
     oss << "\"transport_kind\":\"" << transportKindName(state.transportKind) << "\",";
     oss << "\"transport_status\":\"" << jsonEscape(state.transportStatus) << "\",";
     oss << "\"node_alias\":\"" << jsonEscape(state.nodeAlias) << "\",";
+    oss << "\"auth_enabled\":" << (state.authEnabled ? "true" : "false") << ",";
     oss << "\"rx_source\":\"" << rxSourceName(state.rxSource) << "\",";
     oss << "\"session_mode\":\"" << sessionModeName(state.sessionMode) << "\",";
     oss << "\"band_mode\":\"" << bandModeName(state.bandMode) << "\",";
@@ -998,6 +1006,13 @@ std::string buildStateJson(const SharedState &state) {
     oss << "\"frames_received\":" << state.linkStats.framesReceived << ",";
     oss << "\"frames_dropped\":" << state.linkStats.framesDropped << ",";
     oss << "\"retransmit_count\":" << state.linkStats.retransmitCount << ",";
+    oss << "\"transport_frames_in\":" << state.linkStats.transportFramesIn << ",";
+    oss << "\"transport_frames_dropped\":" << state.linkStats.transportFramesDropped << ",";
+    oss << "\"transport_loss_percent\":" << jsonNumber(state.linkStats.transportLossPercent, 2) << ",";
+    oss << "\"auth_failures\":" << state.linkStats.authFailures << ",";
+    oss << "\"probe_sent\":" << state.linkStats.probeSent << ",";
+    oss << "\"probe_acked\":" << state.linkStats.probeAcked << ",";
+    oss << "\"probe_loss_percent\":" << jsonNumber(state.linkStats.probeLossPercent, 2) << ",";
     oss << "\"rtt_ms\":" << jsonNumber(state.linkStats.rttMs, 2) << ",";
     oss << "\"effective_payload_kbps\":" << jsonNumber(state.linkStats.effectivePayloadKbps, 3);
     oss << "},";
@@ -1499,7 +1514,10 @@ std::string makeIndexHtml() {
                 <div class="stat-row"><span class="stat-label">Bandwidth</span><span class="stat-val" id="statBw">--</span></div>
                 <div class="stat-row"><span class="stat-label">RTT</span><span class="stat-val" id="statRtt">--</span></div>
                 <div class="stat-row"><span class="stat-label">BER</span><span class="stat-val" id="statBer">--</span></div>
+                <div class="stat-row"><span class="stat-label">Transport Loss</span><span class="stat-val" id="statTransportLoss">--</span></div>
                 <div class="stat-row"><span class="stat-label">FPS</span><span class="stat-val" id="statFps">--</span></div>
+                <div class="stat-row"><span class="stat-label">Auth Failures</span><span class="stat-val" id="statAuthFailures">--</span></div>
+                <div class="stat-row"><span class="stat-label">Probe</span><span class="stat-val" id="statProbe">--</span></div>
               </div>
             </div>
             <div class="section">
@@ -1532,6 +1550,24 @@ std::string makeIndexHtml() {
                 <button id="recordBtn" class="btn">Recording: Off</button>
                 <button id="forceKfBtn" class="btn">Force Keyframe</button>
                 <button id="rescanBtn" class="btn">Rescan Devices</button>
+                <button id="sendSnapshotBtn" class="btn">Send Snapshot</button>
+                <button id="runLinkTestBtn" class="btn">Run Link Test</button>
+              </div>
+            </div>
+            <div class="section">
+              <h3>Authentication (V3)</h3>
+              <div class="grid">
+                <div class="field">
+                  <label>Auth Enabled</label>
+                  <select id="authEnabledSelect">
+                    <option value="false">Disabled</option>
+                    <option value="true">Enabled</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>PIN</label>
+                  <input id="authPinInput" type="password" placeholder="PIN (runtime only)" />
+                </div>
               </div>
             </div>
             <div class="section acoustic-section">
@@ -1730,6 +1766,12 @@ std::string makeIndexHtml() {
       sv('statBw', num(data.link_stats && data.link_stats.effective_payload_kbps).toFixed(1) + ' kbps');
       sv('statRtt', num(data.link_stats && data.link_stats.rtt_ms).toFixed(0) + ' ms');
       sv('statBer', num(data.link_stats && data.link_stats.ber).toFixed(5));
+      sv('statTransportLoss', num(data.link_stats && data.link_stats.transport_loss_percent).toFixed(1) + '%');
+      sv('statAuthFailures', num(data.link_stats && data.link_stats.auth_failures).toFixed(0));
+      sv('statProbe',
+        num(data.link_stats && data.link_stats.probe_acked).toFixed(0) + '/' +
+        num(data.link_stats && data.link_stats.probe_sent).toFixed(0) + ' (' +
+        num(data.link_stats && data.link_stats.probe_loss_percent).toFixed(1) + '%)');
       sv('statFps', num(data.metrics && data.metrics.fps).toFixed(1));
       sv('statQueueText', num(data.queue && data.queue.text).toFixed(0));
       sv('statQueueVideo', num(data.queue && data.queue.video).toFixed(0));
@@ -1818,6 +1860,7 @@ std::string makeIndexHtml() {
         document.getElementById('relayImportInput').value = data.relay_import_path || '';
         document.getElementById('relayExportAdvInput').value = data.relay_export_path || '';
         document.getElementById('relayImportAdvInput').value = data.relay_import_path || '';
+        document.getElementById('authEnabledSelect').value = data.auth_enabled ? 'true' : 'false';
         applyRoleToUI(data.link_role || 'duplex');
       }
 
@@ -1870,7 +1913,9 @@ std::string makeIndexHtml() {
         serial_baud: document.getElementById('serialBaudInput').value,
         node_alias: document.getElementById('aliasInput').value,
         relay_export_path: document.getElementById('relayExportInput').value || document.getElementById('relayExportAdvInput').value,
-        relay_import_path: document.getElementById('relayImportInput').value || document.getElementById('relayImportAdvInput').value
+        relay_import_path: document.getElementById('relayImportInput').value || document.getElementById('relayImportAdvInput').value,
+        auth_enabled: document.getElementById('authEnabledSelect').value,
+        auth_pin: document.getElementById('authPinInput').value
       };
     }
 
@@ -1903,7 +1948,7 @@ std::string makeIndexHtml() {
       ['aliasInput','cameraSelect','modeSelect','resSelect','fpsInput','roleSelect','rxSourceSelect',
        'sessionModeSelect','bandModeSelect','audioInSelect','audioOutSelect','mediaPathInput',
        'serialPortInput','serialBaudInput','relayExportInput','relayImportInput',
-       'relayExportAdvInput','relayImportAdvInput']
+       'relayExportAdvInput','relayImportAdvInput','authEnabledSelect','authPinInput']
         .forEach(function(id) {
           document.getElementById(id).addEventListener('input', function() { stateStore.formDirty = true; });
         });
@@ -1930,6 +1975,8 @@ std::string makeIndexHtml() {
       document.getElementById('importRelayBtn').onclick = async function() { await applyControl({ import_relay: true }); };
       document.getElementById('exportRelayAdvBtn').onclick = async function() { await applyControl({ export_relay: true }); };
       document.getElementById('importRelayAdvBtn').onclick = async function() { await applyControl({ import_relay: true }); };
+      document.getElementById('sendSnapshotBtn').onclick = async function() { await applyControl({ send_snapshot: true }); };
+      document.getElementById('runLinkTestBtn').onclick = async function() { await applyControl({ run_link_test: true }); };
 
       async function sendText(txt) {
         await postJson('/api/v2/messages/send', {
@@ -2106,6 +2153,13 @@ void applyControlRequest(const httplib::Request &req, ControlState &control) {
         control.relayImportPath = *value;
     }
 
+    if (auto value = itValue("auth_enabled")) {
+        control.authEnabled = boolFromParam(*value, control.authEnabled);
+    }
+    if (auto value = itValue("auth_pin")) {
+        control.authPin = *value;
+    }
+
     if (auto value = itValue("text_body")) {
         control.outgoingText = *value;
     }
@@ -2121,6 +2175,18 @@ void applyControlRequest(const httplib::Request &req, ControlState &control) {
     if (auto value = itValue("send_text")) {
         if (boolFromParam(*value, false)) {
             control.sendText = true;
+        }
+    }
+
+    if (auto value = itValue("send_snapshot")) {
+        if (boolFromParam(*value, false)) {
+            control.sendSnapshot = true;
+        }
+    }
+
+    if (auto value = itValue("run_link_test")) {
+        if (boolFromParam(*value, false)) {
+            control.runLinkTest = true;
         }
     }
 
@@ -2193,6 +2259,8 @@ struct ControlSnapshot {
     std::string nodeAlias = "Field-Unit";
     std::string relayExportPath = "./relay_out/export.evrelay";
     std::string relayImportPath;
+    bool authEnabled = false;
+    std::string authPin;
     bool linkRunning = false;
     bool forceKey = false;
     bool rescanCamera = false;
@@ -2200,6 +2268,8 @@ struct ControlSnapshot {
     bool startLink = false;
     bool stopLink = false;
     bool sendText = false;
+    bool sendSnapshot = false;
+    bool runLinkTest = false;
     std::string outgoingText;
     TargetScope outgoingTextScope = TargetScope::Broadcast;
     uint64_t outgoingTextTarget = 0;
@@ -2231,6 +2301,8 @@ ControlSnapshot copyControlSnapshot(ControlState &control) {
     out.nodeAlias = control.nodeAlias;
     out.relayExportPath = control.relayExportPath;
     out.relayImportPath = control.relayImportPath;
+    out.authEnabled = control.authEnabled;
+    out.authPin = control.authPin;
     out.linkRunning = control.linkRunning;
     out.forceKey = control.forceNextKeyframe;
     out.rescanCamera = control.rescanCameras;
@@ -2238,6 +2310,8 @@ ControlSnapshot copyControlSnapshot(ControlState &control) {
     out.startLink = control.startLink;
     out.stopLink = control.stopLink;
     out.sendText = control.sendText;
+    out.sendSnapshot = control.sendSnapshot;
+    out.runLinkTest = control.runLinkTest;
     out.outgoingText = control.outgoingText;
     out.outgoingTextScope = control.outgoingTextScope;
     out.outgoingTextTarget = control.outgoingTextTarget;
@@ -2253,6 +2327,8 @@ void clearOneShotControlFlags(ControlState &control,
                               bool clearStartLink,
                               bool clearStopLink,
                               bool clearSendText,
+                              bool clearSendSnapshot,
+                              bool clearRunLinkTest,
                               bool clearExportRelay,
                               bool clearImportRelay) {
     std::lock_guard<std::mutex> lock(control.mutex);
@@ -2274,6 +2350,12 @@ void clearOneShotControlFlags(ControlState &control,
     if (clearSendText) {
         control.sendText = false;
         control.outgoingText.clear();
+    }
+    if (clearSendSnapshot) {
+        control.sendSnapshot = false;
+    }
+    if (clearRunLinkTest) {
+        control.runLinkTest = false;
     }
     if (clearExportRelay) {
         control.exportRelay = false;
@@ -2332,13 +2414,14 @@ public:
     bool push(const CommEnvelopeHeader &header,
               const std::vector<uint8_t> &payload,
               std::vector<uint8_t> &completeEnvelope,
-              std::string &error) {
+              std::string &error,
+              const EnvelopeAuthConfig *auth) {
         completeEnvelope.clear();
         error.clear();
         cleanupExpired();
 
         if (header.fragCount <= 1) {
-            completeEnvelope = serializeCommEnvelope(header, payload);
+            completeEnvelope = serializeCommEnvelope(header, payload, auth);
             return true;
         }
 
@@ -2377,7 +2460,7 @@ public:
         CommEnvelopeHeader merged = entry.header;
         merged.fragIndex = 0;
         merged.fragCount = 1;
-        completeEnvelope = serializeCommEnvelope(merged, assembled);
+        completeEnvelope = serializeCommEnvelope(merged, assembled, auth);
         entries_.erase(key);
         return true;
     }
@@ -2507,6 +2590,9 @@ int main() {
     std::string nodeAlias = "Field-Unit";
     std::string relayExportPath = "./relay_out/export.evrelay";
     std::string relayImportPath;
+    bool authEnabled = false;
+    std::string authPin;
+    EnvelopeAuthConfig envelopeAuth;
 
     SessionConfig sessionConfig;
     sessionConfig.streamId = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2571,6 +2657,7 @@ int main() {
         control.nodeAlias = nodeAlias;
         control.relayExportPath = relayExportPath;
         control.relayImportPath = relayImportPath;
+        control.authEnabled = authEnabled;
     }
 
     SharedState shared;
@@ -2613,6 +2700,7 @@ int main() {
         shared.relayExportPath = relayExportPath;
         shared.relayImportPath = relayImportPath;
         shared.nodeAlias = nodeAlias;
+        shared.authEnabled = authEnabled;
     }
 
     const std::string indexHtml = makeIndexHtml();
@@ -2759,6 +2847,19 @@ int main() {
     nodeIdentity.alias = nodeAlias;
     Router router(nodeIdentity);
 
+    auto enqueueSnapshotFromFrame = [&](const cv::Mat &frame) {
+        if (frame.empty()) {
+            return;
+        }
+        SnapshotMessage snapshot;
+        snapshot.width = static_cast<uint16_t>(std::clamp(frame.cols, 0, 65535));
+        snapshot.height = static_cast<uint16_t>(std::clamp(frame.rows, 0, 65535));
+        snapshot.jpeg = encodeJpeg(frame, 84);
+        if (!snapshot.jpeg.empty()) {
+            router.enqueueSnapshot(snapshot, 120000);
+        }
+    };
+
     PersistentStore store;
     std::string storeError;
     if (!store.init("./relay_store", storeError)) {
@@ -2792,6 +2893,7 @@ int main() {
         sessionConfigV2.residualStep = static_cast<uint8_t>(std::max(1, params.residualStep));
         sessionConfigV2.keyframeInterval = static_cast<uint8_t>(activeKeyframeInterval(params, shortKeyframeInterval));
         sessionConfigV2.targetFps = static_cast<float>(params.targetFps);
+        sessionConfigV2.version = 3;
         sessionConfigV2.configHash = computeSessionConfigV2Hash(sessionConfigV2);
     };
     rebuildSessionConfig(false);
@@ -2828,23 +2930,53 @@ int main() {
     };
     configureTransports();
 
+    auto refreshEnvelopeAuth = [&]() {
+        envelopeAuth.enabled = authEnabled && !authPin.empty();
+        if (envelopeAuth.enabled) {
+            envelopeAuth.key = deriveAuthKeyFromPin(authPin);
+        } else {
+            envelopeAuth.key.fill(0);
+        }
+    };
+    refreshEnvelopeAuth();
+
+    FallbackController fallbackController(sessionConfigV2.maxFallbackStage);
+    FallbackStage fallbackStage = FallbackStage::Normal;
+    uint64_t prevDroppedForFallback = 0;
+    uint64_t prevRetransForFallback = 0;
+    auto lastFallbackSnapshot = Clock::now() - std::chrono::seconds(10);
+
+    struct ProbeRunState {
+        bool active = false;
+        int remaining = 0;
+        uint64_t nextProbeId = 1;
+        std::chrono::steady_clock::time_point nextSend{};
+        std::map<uint64_t, uint64_t> pendingSentMs;
+    };
+    ProbeRunState probeRun;
+
+    cv::Mat latestReceivedSnapshot;
+
     auto startActiveTransport = [&]() {
         if (!linkRunning) {
             return;
         }
         std::string error;
         if (TransportAdapter *adapter = transportManager.activeAdapter()) {
-            if (!adapter->running() && !adapter->start(error)) {
+            const bool wasRunning = adapter->running();
+            if (!wasRunning && !adapter->start(error)) {
                 writeStateStatus(shared, "transport start failed: " + error);
                 linkRunning = false;
                 std::lock_guard<std::mutex> lock(control.mutex);
                 control.linkRunning = false;
                 return;
             }
+            if (!wasRunning) {
+                linkStartTime = Clock::now();
+                startupConfigBurstRemaining = 8;
+                forceConfigBurst = true;
+            }
         }
-        linkStartTime = Clock::now();
-        startupConfigBurstRemaining = 8;
-        forceConfigBurst = true;
     };
 
     EnvelopeFragmentReassembler envelopeReassembler(std::chrono::milliseconds(4000));
@@ -2854,8 +2986,12 @@ int main() {
         CommEnvelopeHeader header;
         std::vector<uint8_t> payload;
         std::string error;
-        if (!deserializeCommEnvelope(envelope, header, payload, error)) {
+        bool authFailure = false;
+        if (!deserializeCommEnvelope(envelope, header, payload, error, &envelopeAuth, &authFailure)) {
             linkStats.framesDropped += 1;
+            if (authFailure) {
+                linkStats.authFailures += 1;
+            }
             return;
         }
 
@@ -2864,9 +3000,9 @@ int main() {
         linkStats.syncLocked = true;
 
         std::string persistError;
-        (void)store.persistInbound(header, payload, isRelayablePayloadType(header.payloadType), persistError);
+        (void)store.persistInbound(header, payload, isRelayablePayloadType(header.payloadType), persistError, &envelopeAuth);
 
-        RouterEvents events = router.processIncomingEnvelope(envelope, now);
+        RouterEvents events = router.processIncomingEnvelope(envelope, now, &envelopeAuth);
         for (const auto &video : events.videoFrames) {
             auto &decoderPtr = remoteDecoders[video.header.senderNodeId];
             if (!decoderPtr) {
@@ -2884,10 +3020,27 @@ int main() {
             haveStats = true;
         }
         for (const auto &snapshot : events.snapshots) {
-            (void)snapshot;
+            const cv::Mat jpegMat = cv::imdecode(snapshot.snapshot.jpeg, cv::IMREAD_COLOR);
+            if (!jpegMat.empty()) {
+                latestReceivedSnapshot = jpegMat;
+            }
         }
         for (const auto &text : events.texts) {
             (void)text;
+        }
+        for (const auto &probeEvent : events.probes) {
+            if (probeEvent.probe.kind != ProbeKind::Pong) {
+                continue;
+            }
+            const auto it = probeRun.pendingSentMs.find(probeEvent.probe.probeId);
+            if (it == probeRun.pendingSentMs.end()) {
+                continue;
+            }
+            const uint64_t nowMs = nowUnixMs();
+            const double rttSample = static_cast<double>(nowMs - probeEvent.probe.sentTsMs);
+            linkStats.rttMs = (linkStats.rttMs <= 0.0) ? rttSample : (0.75 * linkStats.rttMs + 0.25 * rttSample);
+            linkStats.probeAcked += 1;
+            probeRun.pendingSentMs.erase(it);
         }
     };
 
@@ -2899,6 +3052,7 @@ int main() {
         const ControlSnapshot desired = copyControlSnapshot(control);
         bool transportNeedsReconfigure = false;
         bool bumpConfigVersion = false;
+        bool oneShotSnapshot = false;
 
         if (desired.rescanCamera) {
             const std::vector<int> cameras = probeAvailableCameraIndices(kMaxCameraProbe);
@@ -2912,7 +3066,7 @@ int main() {
                 }
                 shared.status = "camera list refreshed";
             }
-            clearOneShotControlFlags(control, false, true, false, false, false, false, false, false);
+            clearOneShotControlFlags(control, false, true, false, false, false, false, false, false, false, false);
         }
         if (desired.rescanAudio) {
             audioInputs = audioEngine.listInputDevices();
@@ -2923,11 +3077,11 @@ int main() {
                 shared.audioOutputs = audioOutputs;
                 shared.status = "audio list refreshed";
             }
-            clearOneShotControlFlags(control, false, false, true, false, false, false, false, false);
+            clearOneShotControlFlags(control, false, false, true, false, false, false, false, false, false, false);
         }
         if (desired.forceKey) {
             encoder.forceNextKeyframe();
-            clearOneShotControlFlags(control, true, false, false, false, false, false, false, false);
+            clearOneShotControlFlags(control, true, false, false, false, false, false, false, false, false, false);
         }
 
         const int desiredResolutionIndex =
@@ -2948,8 +3102,6 @@ int main() {
             mode = desired.mode;
             resolutionIndex = desiredResolutionIndex;
             targetFps = desiredFps;
-            params = makeRuntimeParams(mode, resolutionIndex, targetFps);
-            resetCodecPipeline();
             bumpConfigVersion = true;
         }
 
@@ -3029,14 +3181,19 @@ int main() {
             relayImportPath = desired.relayImportPath;
             transportNeedsReconfigure = true;
         }
+        if (desired.authEnabled != authEnabled || desired.authPin != authPin) {
+            authEnabled = desired.authEnabled;
+            authPin = desired.authPin;
+            refreshEnvelopeAuth();
+        }
 
         if (desired.startLink) {
             linkRunning = true;
-            clearOneShotControlFlags(control, false, false, false, true, false, false, false, false);
+            clearOneShotControlFlags(control, false, false, false, true, false, false, false, false, false, false);
         }
         if (desired.stopLink) {
             linkRunning = false;
-            clearOneShotControlFlags(control, false, false, false, false, true, false, false, false);
+            clearOneShotControlFlags(control, false, false, false, false, true, false, false, false, false, false);
         }
         if (desired.linkRunning != linkRunning && !desired.startLink && !desired.stopLink) {
             linkRunning = desired.linkRunning;
@@ -3046,7 +3203,20 @@ int main() {
             if (!desired.outgoingText.empty()) {
                 router.enqueueText(desired.outgoingText, desired.outgoingTextScope, desired.outgoingTextTarget);
             }
-            clearOneShotControlFlags(control, false, false, false, false, false, true, false, false);
+            clearOneShotControlFlags(control, false, false, false, false, false, true, false, false, false, false);
+        }
+        if (desired.sendSnapshot) {
+            oneShotSnapshot = true;
+            clearOneShotControlFlags(control, false, false, false, false, false, false, true, false, false, false);
+        }
+        if (desired.runLinkTest) {
+            probeRun.active = true;
+            probeRun.remaining = 10;
+            probeRun.nextSend = Clock::now();
+            probeRun.pendingSentMs.clear();
+            linkStats.probeSent = 0;
+            linkStats.probeAcked = 0;
+            clearOneShotControlFlags(control, false, false, false, false, false, false, false, true, false, false);
         }
 
         if (desired.exportRelay) {
@@ -3057,7 +3227,7 @@ int main() {
             } else {
                 writeStateStatus(shared, "relay export complete (" + std::to_string(exportedCount) + " records)");
             }
-            clearOneShotControlFlags(control, false, false, false, false, false, false, true, false);
+            clearOneShotControlFlags(control, false, false, false, false, false, false, false, false, true, false);
         }
         if (desired.importRelay) {
             std::vector<std::vector<uint8_t>> imported;
@@ -3071,7 +3241,49 @@ int main() {
                 }
                 writeStateStatus(shared, "relay import complete (" + std::to_string(imported.size()) + " envelopes)");
             }
-            clearOneShotControlFlags(control, false, false, false, false, false, false, false, true);
+            clearOneShotControlFlags(control, false, false, false, false, false, false, false, false, false, true);
+        }
+
+        fallbackController.setMaxStage(sessionConfigV2.maxFallbackStage);
+        if (!linkRunning) {
+            fallbackController.reset(FallbackStage::Normal);
+        } else {
+            const uint64_t droppedNow = linkStats.transportFramesDropped;
+            const uint64_t retransNow = linkStats.retransmitCount;
+            const uint64_t droppedDelta = (droppedNow >= prevDroppedForFallback) ? (droppedNow - prevDroppedForFallback) : 0;
+            const uint64_t retransDelta = (retransNow >= prevRetransForFallback) ? (retransNow - prevRetransForFallback) : 0;
+            prevDroppedForFallback = droppedNow;
+            prevRetransForFallback = retransNow;
+
+            FallbackInputWindow fallbackInput;
+            fallbackInput.queueVideo = queueStats.queuedVideo;
+            fallbackInput.queueInflight = queueStats.inFlightReliable;
+            fallbackInput.droppedDelta = droppedDelta;
+            fallbackInput.retransmitDelta = retransDelta;
+            fallbackInput.transportLossPercent = linkStats.transportLossPercent;
+            fallbackInput.syncLocked = linkStats.syncLocked;
+            if (fallbackController.update(fallbackInput, Clock::now())) {
+                bumpConfigVersion = true;
+                forceConfigBurst = true;
+            }
+        }
+        fallbackStage = fallbackController.stage();
+
+        int effectiveResolutionIndex = resolutionIndex;
+        double effectiveFps = targetFps;
+        if (static_cast<int>(fallbackStage) >= static_cast<int>(FallbackStage::LowerFps)) {
+            effectiveFps = std::max(0.8, targetFps * 0.65);
+        }
+        if (static_cast<int>(fallbackStage) >= static_cast<int>(FallbackStage::LowerResolution)) {
+            effectiveResolutionIndex = std::max(0, resolutionIndex - 1);
+        }
+
+        const CodecParams effectiveParams = makeRuntimeParams(mode, effectiveResolutionIndex, effectiveFps);
+        if (effectiveParams.mode != params.mode || effectiveParams.width != params.width || effectiveParams.height != params.height ||
+            std::abs(effectiveParams.targetFps - params.targetFps) > 1e-6) {
+            params = effectiveParams;
+            resetCodecPipeline();
+            bumpConfigVersion = true;
         }
 
         if (bumpConfigVersion) {
@@ -3096,6 +3308,8 @@ int main() {
         } else {
             stopAllTransports();
             linkStats.syncLocked = false;
+            probeRun.active = false;
+            probeRun.pendingSentMs.clear();
         }
 
         cv::Mat bgr;
@@ -3118,6 +3332,15 @@ int main() {
         const auto now = Clock::now();
         const bool roleSend = linkRole != LinkRole::Receive;
         const bool roleReceive = linkRole != LinkRole::Send;
+
+        if (oneShotSnapshot && linkRunning && roleSend) {
+            enqueueSnapshotFromFrame(bgr);
+        }
+        if (linkRunning && roleSend && fallbackStage == FallbackStage::SnapshotOnly &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFallbackSnapshot).count() >= 1500) {
+            enqueueSnapshotFromFrame(bgr);
+            lastFallbackSnapshot = now;
+        }
 
         if (now >= nextEncodeTime) {
             const cv::Mat grayCodec = resizeAndGrayscale(bgr, params.width, params.height);
@@ -3166,7 +3389,7 @@ int main() {
                 }
             }
 
-            if (linkRunning && roleSend) {
+            if (linkRunning && roleSend && static_cast<int>(fallbackStage) < static_cast<int>(FallbackStage::SnapshotOnly)) {
                 router.enqueueVideoFrame(packet.bytes, packet.meta.frameType == FrameType::Keyframe);
             }
 
@@ -3194,17 +3417,24 @@ int main() {
                     std::vector<std::vector<uint8_t>> incoming;
                     adapter->pollIncoming(incoming);
                     for (const auto &wire : incoming) {
+                        linkStats.transportFramesIn += 1;
                         CommEnvelopeHeader header;
                         std::vector<uint8_t> payload;
                         std::string error;
-                        if (!deserializeCommEnvelope(wire, header, payload, error)) {
+                        bool authFailure = false;
+                        if (!deserializeCommEnvelope(wire, header, payload, error, &envelopeAuth, &authFailure)) {
                             linkStats.framesDropped += 1;
+                            linkStats.transportFramesDropped += 1;
+                            if (authFailure) {
+                                linkStats.authFailures += 1;
+                            }
                             continue;
                         }
                         std::vector<uint8_t> completeEnvelope;
-                        if (!envelopeReassembler.push(header, payload, completeEnvelope, error)) {
+                        if (!envelopeReassembler.push(header, payload, completeEnvelope, error, &envelopeAuth)) {
                             if (!error.empty()) {
                                 linkStats.framesDropped += 1;
+                                linkStats.transportFramesDropped += 1;
                             }
                             continue;
                         }
@@ -3213,6 +3443,21 @@ int main() {
                 }
 
                 if (roleSend) {
+                    while (probeRun.active && probeRun.remaining > 0 && now >= probeRun.nextSend) {
+                        TransportProbePayload probe;
+                        probe.probeId = probeRun.nextProbeId++;
+                        probe.kind = ProbeKind::Ping;
+                        probe.sentTsMs = nowUnixMs();
+                        router.enqueueTransportProbe(probe, TargetScope::Broadcast, 0, 12000);
+                        probeRun.pendingSentMs[probe.probeId] = probe.sentTsMs;
+                        linkStats.probeSent += 1;
+                        probeRun.nextSend += std::chrono::milliseconds(200);
+                        probeRun.remaining -= 1;
+                    }
+                    if (probeRun.active && probeRun.remaining == 0 && probeRun.pendingSentMs.empty()) {
+                        probeRun.active = false;
+                    }
+
                     const bool periodicBeacon =
                         std::chrono::duration_cast<std::chrono::milliseconds>(now - lastConfigBeacon).count() >= 2500;
                     if (startupConfigBurstRemaining > 0 || forceConfigBurst || periodicBeacon) {
@@ -3232,7 +3477,7 @@ int main() {
                     for (const auto &packet : outgoing) {
                         std::string persistError;
                         (void)store.persistOutbound(
-                            packet.header, packet.payload, isRelayablePayloadType(packet.header.payloadType), persistError);
+                            packet.header, packet.payload, isRelayablePayloadType(packet.header.payloadType), persistError, &envelopeAuth);
 
                         std::vector<std::vector<uint8_t>> frags =
                             fragmentCommPayload(packet.payload, transportFragmentBytes(transportKind));
@@ -3242,8 +3487,11 @@ int main() {
                             fragmentHeader.fragIndex = frag;
                             fragmentHeader.fragCount = std::max<uint16_t>(1, fragCount);
                             const std::vector<uint8_t> envelope =
-                                serializeCommEnvelope(fragmentHeader, frags[static_cast<std::size_t>(frag)]);
+                                serializeCommEnvelope(fragmentHeader, frags[static_cast<std::size_t>(frag)], &envelopeAuth);
                             adapter->sendEnvelope(envelope);
+                        }
+                        if (packet.isRetry) {
+                            linkStats.retransmitCount += 1;
                         }
                         linkPayloadBytesSent += packet.payload.size();
                     }
@@ -3255,11 +3503,14 @@ int main() {
                     linkStats.fecRecoveredCount += delta.fecRecoveredCount;
                     linkStats.framesReceived += delta.framesReceived;
                     linkStats.framesDropped += delta.framesDropped;
-                    linkStats.retransmitCount += delta.retransmitCount;
                     if (delta.rttMs > 0.0) {
                         linkStats.rttMs = delta.rttMs;
                     }
-                    linkStats.berEstimate = delta.berEstimate;
+                    if (delta.berEstimate > 0.0) {
+                        linkStats.berEstimate = (linkStats.berEstimate <= 0.0)
+                                                    ? delta.berEstimate
+                                                    : (0.8 * linkStats.berEstimate + 0.2 * delta.berEstimate);
+                    }
                 }
             }
         }
@@ -3272,6 +3523,14 @@ int main() {
             0.001, std::chrono::duration_cast<std::chrono::duration<double>>(now - linkStartTime).count());
         linkStats.effectivePayloadKbps =
             (static_cast<double>(linkPayloadBytesSent + linkPayloadBytesReceived) * 8.0) / (linkElapsed * 1000.0);
+        linkStats.transportLossPercent =
+            (100.0 * static_cast<double>(linkStats.transportFramesDropped)) /
+            std::max(1.0, static_cast<double>(linkStats.transportFramesIn));
+        linkStats.probeLossPercent =
+            (linkStats.probeSent == 0)
+                ? 0.0
+                : (100.0 * static_cast<double>(linkStats.probeSent - std::min(linkStats.probeAcked, linkStats.probeSent)) /
+                   static_cast<double>(linkStats.probeSent));
 
         const int panelHeight = std::clamp(bgr.rows, 300, 460);
         const int panelWidth = std::max(340, panelHeight * std::max(1, bgr.cols) / std::max(1, bgr.rows));
@@ -3310,6 +3569,8 @@ int main() {
             receivedPanel =
                 renderForDisplay(displayFrame, panelSize, useReceivedEnhancement, useReceivedDithering, params.blockSize);
             drawFaceRects(receivedPanel, rawFacesPanel, cv::Scalar(150, 255, 100));
+        } else if (!latestReceivedSnapshot.empty()) {
+            cv::resize(latestReceivedSnapshot, receivedPanel, panelSize, 0.0, 0.0, cv::INTER_AREA);
         }
 
         std::vector<uint8_t> rawJpeg = encodeJpeg(rawPanel, 82);
@@ -3363,10 +3624,11 @@ int main() {
             shared.nodeAlias = nodeAlias;
             shared.relayExportPath = relayExportPath;
             shared.relayImportPath = relayImportPath;
+            shared.authEnabled = authEnabled;
             shared.queueStats = queueStats;
             shared.messages = timeline;
             shared.latestTextCursor = latestTextCursor;
-            shared.fallbackStage = FallbackStage::Normal;
+            shared.fallbackStage = fallbackStage;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(3));
