@@ -1057,37 +1057,79 @@ std::string makeIndexHtml() {
       display: grid;
       gap: 12px;
     }
+    /* === TOPBAR === */
     .topbar {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 16px;
-      padding: 12px;
-      display: grid;
-      gap: 10px;
-    }
-    .bar-row {
-      display: grid;
-      gap: 10px;
-      grid-template-columns: minmax(240px, 1.2fr) minmax(0, 2fr);
+      padding: 11px 16px;
+      display: flex;
       align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
     }
-    .title h1 { margin: 0; font-size: 22px; line-height: 1.15; }
-    .status { margin-top: 5px; color: var(--muted); font-size: 13px; line-height: 1.3; }
-    .meter { display: grid; gap: 6px; }
-    progress { width: 100%; height: 13px; appearance: none; }
-    progress::-webkit-progress-bar { background: #0f1611; border-radius: 999px; }
-    progress::-webkit-progress-value { background: linear-gradient(90deg, #37ca6f, var(--accent)); border-radius: 999px; }
+    .topbar-left { flex: 1; min-width: 180px; }
+    .topbar-left h1 { margin: 0; font-size: 18px; line-height: 1.2; }
+    .topbar-center {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .conn-dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--danger);
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .conn-dot.searching { background: var(--warn); animation: blink 1.2s ease-in-out infinite; }
+    .conn-dot.linked { background: var(--accent); }
+    @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .bw-label { color: var(--accent); font-weight: 600; }
+    /* === LAYOUT === */
     .layout {
       display: grid;
       gap: 12px;
       grid-template-columns: minmax(0, 2.3fr) minmax(420px, 1fr);
       align-items: start;
     }
-    .feeds {
+    /* === FEEDS AREA === */
+    .feeds-area {
       display: grid;
       gap: 10px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: 1fr;
     }
+    [data-role="send"] .feeds-area { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+    [data-role="duplex"] .feeds-area { grid-template-columns: 1fr 1fr; }
+    .feed-secondary-card { display: none; }
+    [data-role="send"] .feed-secondary-card,
+    [data-role="duplex"] .feed-secondary-card { display: block; }
+    .feed-wrap { position: relative; }
+    .feed-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(10,16,12,0.82);
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      z-index: 2;
+    }
+    .feed-overlay.hidden { display: none !important; }
+    /* === CARD === */
     .card {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -1111,6 +1153,7 @@ std::string makeIndexHtml() {
       background: #0a100c;
       display: block;
     }
+    /* === SIDE PANEL === */
     .side {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -1124,7 +1167,7 @@ std::string makeIndexHtml() {
     .tabs {
       display: grid;
       gap: 8px;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
     }
     .tabs button, .btn {
       border-radius: 10px;
@@ -1179,229 +1222,464 @@ std::string makeIndexHtml() {
     .actions {
       display: grid;
       gap: 8px;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
     }
+    /* === ROLE PICKER === */
+    .role-picker {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .role-btn {
+      padding: 12px 8px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #1a2a24;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 5px;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+      width: 100%;
+    }
+    .role-btn .role-icon { font-size: 18px; line-height: 1; }
+    .role-btn.active { background: var(--accent-soft); border-color: var(--accent); color: #deffe9; }
+    /* === LINK TOGGLE BUTTON === */
+    .link-btn {
+      width: 100%;
+      padding: 14px;
+      border-radius: 12px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      letter-spacing: 0.02em;
+    }
+    .link-btn.start { background: var(--accent-soft); border: 1px solid var(--accent); color: #deffe9; }
+    .link-btn.stop { background: #3f2323; border: 1px solid #8a4c4c; color: #ffdcdc; }
+    /* === MESSAGES === */
     .chat {
       border: 1px solid var(--line);
       border-radius: 10px;
       background: #101712;
-      max-height: 280px;
+      max-height: 300px;
       overflow: auto;
-      padding: 8px;
-      display: grid;
-      gap: 6px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
       font-size: 12px;
     }
-    .msg { padding: 7px 8px; border: 1px solid #2d4037; border-radius: 8px; background: #111b16; }
-    .msg .meta { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
-    .stats {
+    .msg-out, .msg-in {
+      padding: 8px 10px;
+      border-radius: 10px;
+      max-width: 88%;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .msg-out { background: var(--accent-soft); border: 1px solid #3a6b4d; align-self: flex-end; }
+    .msg-in { background: #1a2a24; border: 1px solid var(--line); align-self: flex-start; }
+    .msg-meta {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 3px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .msg-state { font-size: 10px; padding: 1px 5px; border-radius: 999px; font-weight: 700; }
+    .s0 { background: #253530; color: var(--muted); }
+    .s1 { background: #1e3d2b; color: #7acca0; }
+    .s2 { background: #1b4530; color: var(--accent); }
+    .s3 { background: #3d3010; color: var(--warn); }
+    .s4 { background: #3f2323; color: var(--danger); }
+    /* === STATUS TAB === */
+    .stat-grid { display: grid; gap: 4px; }
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: #12201a;
+      border: 1px solid #273d30;
+    }
+    .stat-label { color: var(--muted); font-size: 12px; }
+    .stat-val { font-size: 12px; font-weight: 600; color: var(--ink); }
+    /* === RELAY INFO === */
+    .relay-info-box {
+      background: #1a2d22;
+      border: 1px solid #3a5140;
+      border-radius: 10px;
+      padding: 10px;
       font-size: 12px;
       color: var(--muted);
-      display: grid;
-      gap: 6px;
+      line-height: 1.5;
     }
-    .chip-row {
-      display: grid;
-      gap: 8px;
-      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    }
-    .chip {
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #13201a;
-      padding: 8px;
-      font-size: 12px;
-    }
-    .badge { color: var(--warn); font-weight: 600; }
+    /* === TRANSPORT / ROLE CONDITIONAL === */
+    .acoustic-section { display: none; }
+    [data-transport="acoustic"] .acoustic-section { display: grid; }
+    .serial-section { display: none; }
+    [data-transport="serial"] .serial-section { display: grid; }
+    .relay-section { display: none; }
+    [data-transport="file_relay"] .relay-section { display: grid; }
+    [data-role="receive"] .camera-field { display: none; }
+    /* === MISC === */
     .hidden { display: none !important; }
-    .spacer { height: 2px; }
-    .layout {
-      align-items: start;
-    }
+    /* === MEDIA QUERIES === */
     @media (max-width: 1480px) {
       .layout { grid-template-columns: minmax(0, 1.7fr) minmax(360px, 1fr); }
-      .tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
     @media (max-width: 1260px) {
-      .bar-row { grid-template-columns: 1fr; }
       .layout { grid-template-columns: 1fr; }
-      .feeds { grid-template-columns: 1fr; }
       .side { max-height: none; }
       .tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <section class="topbar">
-      <div class="bar-row">
-        <div class="title">
-          <h1>Emergency Communicator</h1>
-          <div class="status" id="statusText">Booting communicator...</div>
-        </div>
-        <div class="meter">
-          <progress id="bwBar" max="220" value="0"></progress>
-          <div id="bwText">live 0.00 kbps | smooth 0.00 kbps | avg 0.00 kbps</div>
-        </div>
+  <div class="shell" data-role="duplex" data-transport="acoustic">
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1>Emergency Communicator</h1>
       </div>
-      <div class="chip-row">
-        <div class="chip" id="chipTransport">transport --</div>
-        <div class="chip" id="chipRole">role --</div>
-        <div class="chip" id="chipSync">sync --</div>
-        <div class="chip" id="chipQueue">queue --</div>
+      <div class="topbar-center">
+        <span class="conn-dot" id="connDot"></span>
+        <span id="connLabel">Stopped</span>
       </div>
-    </section>
-    <section class="layout">
-      <div class="feeds">
-        <article class="card"><div class="label">Raw Input</div><img id="feedRaw" class="feedimg" alt="raw" /></article>
-        <article class="card"><div class="label">Sent Stream</div><img id="feedSent" class="feedimg" alt="sent" /></article>
-        <article class="card"><div class="label">Received Stream</div><img id="feedReceived" class="feedimg" alt="received" /></article>
+      <div class="topbar-right">
+        <span id="topbarTransport">Acoustic</span>
+        <span id="topbarBw" class="bw-label"></span>
       </div>
+    </header>
+    <main class="layout">
+      <section class="feeds-area">
+        <article class="card">
+          <div class="label" id="feedMainLabel">Raw Input</div>
+          <div class="feed-wrap">
+            <img id="feedMain" class="feedimg" alt="main feed" />
+            <div class="feed-overlay hidden" id="feedOverlay">Waiting for signal...</div>
+          </div>
+        </article>
+        <article class="card feed-secondary-card">
+          <div class="label" id="feedSecondaryLabel">Received Stream</div>
+          <img id="feedSecondary" class="feedimg" alt="secondary feed" />
+        </article>
+      </section>
       <aside class="side">
-        <div class="tabs">
-          <button id="tabBtnLink" class="active">Link</button>
-          <button id="tabBtnSend">Send</button>
-          <button id="tabBtnReceive">Receive</button>
+        <nav class="tabs">
+          <button id="tabBtnSetup" class="active">Setup</button>
+          <button id="tabBtnMessages">Messages</button>
           <button id="tabBtnStatus">Status</button>
           <button id="tabBtnAdvanced">Advanced</button>
-        </div>
+        </nav>
         <div class="panel-scroll">
-          <section id="tabLink" class="tab active">
+
+          <!-- SETUP TAB -->
+          <section id="tabSetup" class="tab active">
             <div class="section">
-              <h3>Quick Setup</h3>
-              <div class="hint">Use this section for normal operation. Advanced transport tuning is in the Advanced tab.</div>
+              <h3>Role</h3>
+              <div class="role-picker">
+                <button class="role-btn" id="roleBtnSend">
+                  <span class="role-icon">&#8593;</span>SEND
+                </button>
+                <button class="role-btn" id="roleBtnReceive">
+                  <span class="role-icon">&#8595;</span>RECEIVE
+                </button>
+                <button class="role-btn active" id="roleBtnDuplex">
+                  <span class="role-icon">&#8597;</span>DUPLEX
+                </button>
+              </div>
+              <select id="roleSelect" style="display:none">
+                <option value="duplex">Duplex</option>
+                <option value="send">Send</option>
+                <option value="receive">Receive</option>
+              </select>
+            </div>
+            <div class="section">
+              <h3>Connection</h3>
               <div class="grid">
-                <div class="field"><label>Node Alias</label><input id="aliasInput" type="text" /></div>
-                <div class="field"><label>Camera</label><select id="cameraSelect"></select></div>
-                <div class="field"><label>Transport</label><select id="transportSelect"><option value="acoustic">Acoustic</option><option value="serial">Serial</option><option value="optical">Optical</option><option value="file_relay">File Relay</option></select></div>
-                <div class="field"><label>Role</label><select id="roleSelect"><option value="duplex">Duplex</option><option value="send">Send</option><option value="receive">Receive</option></select></div>
-                <div class="field"><label>Quality</label><select id="modeSelect"><option value="safer">Safer</option><option value="aggressive">Aggressive</option></select></div>
-                <div class="field"><label>Resolution</label><select id="resSelect"><option value="96x72">96x72</option><option value="128x96">128x96</option><option value="160x120">160x120</option><option value="192x144">192x144</option></select></div>
+                <div class="field"><label>Node Alias</label><input id="aliasInput" type="text" placeholder="my-node" /></div>
+                <div class="field"><label>Transport</label>
+                  <select id="transportSelect">
+                    <option value="acoustic">Acoustic</option>
+                    <option value="serial">Serial</option>
+                    <option value="optical">Optical</option>
+                    <option value="file_relay">File Relay</option>
+                  </select>
+                </div>
+                <div class="field"><label>Quality</label>
+                  <select id="modeSelect">
+                    <option value="safer">Safer</option>
+                    <option value="aggressive">Aggressive</option>
+                  </select>
+                </div>
+                <div class="field"><label>Resolution</label>
+                  <select id="resSelect">
+                    <option value="96x72">96x72</option>
+                    <option value="128x96">128x96</option>
+                    <option value="160x120">160x120</option>
+                    <option value="192x144">192x144</option>
+                  </select>
+                </div>
                 <div class="field"><label>Target FPS</label><input id="fpsInput" type="number" min="0.2" step="0.1" /></div>
               </div>
-              <div class="actions">
-                <button id="applyBtn" class="btn primary">Apply Settings</button>
-                <button id="startBtn" class="btn primary">Start Link</button>
-                <button id="stopBtn" class="btn danger">Stop Link</button>
+            </div>
+            <div class="section camera-field">
+              <h3>Camera</h3>
+              <div class="grid">
+                <div class="field full"><label>Camera Source</label><select id="cameraSelect"></select></div>
               </div>
             </div>
+            <div class="section relay-section">
+              <h3>Relay Paths</h3>
+              <div class="hint">Configure bundle paths before starting.</div>
+              <div class="grid">
+                <div class="field full">
+                  <label>Export Bundle File</label>
+                  <input id="relayExportInput" type="text" placeholder="./relay_out/export.evrelay" />
+                </div>
+                <div class="field full">
+                  <label>Import Bundle File</label>
+                  <input id="relayImportInput" type="text" placeholder="./relay_in/import.evrelay" />
+                </div>
+              </div>
+              <div class="actions">
+                <button id="exportRelayBtn" class="btn">Export</button>
+                <button id="importRelayBtn" class="btn">Import</button>
+              </div>
+            </div>
+            <button id="linkToggleBtn" class="link-btn start">Start Link</button>
           </section>
 
-          <section id="tabSend" class="tab">
+          <!-- MESSAGES TAB -->
+          <section id="tabMessages" class="tab">
             <div class="section">
-              <h3>Reliable Text Channel</h3>
+              <h3>Compose</h3>
               <div class="grid">
-                <div class="field"><label>Target Scope</label><select id="textScopeSelect"><option value="broadcast">Broadcast</option><option value="direct">Direct</option></select></div>
-                <div class="field"><label>Target Node ID</label><input id="textTargetInput" type="number" min="0" step="1" value="0" /></div>
-                <div class="field full"><label>Message</label><textarea id="textBodyInput" placeholder="Type emergency message..."></textarea></div>
+                <div class="field"><label>Target Scope</label>
+                  <select id="textScopeSelect">
+                    <option value="broadcast">Broadcast</option>
+                    <option value="direct">Direct</option>
+                  </select>
+                </div>
+                <div class="field" id="textTargetField" style="display:none">
+                  <label>Target Node ID</label>
+                  <input id="textTargetInput" type="number" min="0" step="1" value="0" />
+                </div>
+                <div class="field full">
+                  <label>Message</label>
+                  <textarea id="textBodyInput" placeholder="Type emergency message..."></textarea>
+                </div>
               </div>
               <div class="actions">
                 <button id="sendTextBtn" class="btn primary">Send Message</button>
-                <button id="quickNeedBtn" class="btn">Quick: Need Help</button>
-                <button id="quickSafeBtn" class="btn">Quick: Safe Here</button>
-                <button id="quickMoveBtn" class="btn">Quick: Move North</button>
+                <button id="quickNeedBtn" class="btn">Need Help</button>
+                <button id="quickSafeBtn" class="btn">Safe Here</button>
+                <button id="quickMoveBtn" class="btn">Move North</button>
               </div>
             </div>
             <div class="section">
-              <h3>Message Timeline</h3>
+              <h3>Message History</h3>
               <div id="chatLog" class="chat"></div>
             </div>
           </section>
 
-          <section id="tabReceive" class="tab">
-            <div class="section">
-              <h3>Receive & Relay</h3>
-              <div class="grid">
-                <div class="field full"><label>Relay Export Bundle</label><input id="relayExportInput" type="text" placeholder="./relay_out/export.evrelay" /></div>
-                <div class="field full"><label>Relay Import Bundle</label><input id="relayImportInput" type="text" placeholder="./relay_in/import.evrelay" /></div>
-              </div>
-              <div class="actions">
-                <button id="exportRelayBtn" class="btn">Export Relay Bundle</button>
-                <button id="importRelayBtn" class="btn">Import Relay Bundle</button>
-              </div>
-            </div>
-          </section>
-
+          <!-- STATUS TAB -->
           <section id="tabStatus" class="tab">
-            <div class="section stats">
-              <div id="statTransport">transport --</div>
-              <div id="statFallback">fallback --</div>
-              <div id="statQueue">queue --</div>
-              <div id="statCodec">codec --</div>
-              <div id="statLink">link --</div>
-              <div id="statQuality">quality --</div>
-              <div id="statFaces">faces --</div>
+            <div class="section">
+              <h3>Connection</h3>
+              <div class="stat-grid">
+                <div class="stat-row"><span class="stat-label">Signal</span><span class="stat-val" id="statSignal">--</span></div>
+                <div class="stat-row"><span class="stat-label">Bandwidth</span><span class="stat-val" id="statBw">--</span></div>
+                <div class="stat-row"><span class="stat-label">RTT</span><span class="stat-val" id="statRtt">--</span></div>
+                <div class="stat-row"><span class="stat-label">BER</span><span class="stat-val" id="statBer">--</span></div>
+                <div class="stat-row"><span class="stat-label">FPS</span><span class="stat-val" id="statFps">--</span></div>
+              </div>
+            </div>
+            <div class="section">
+              <h3>Queue</h3>
+              <div class="stat-grid">
+                <div class="stat-row"><span class="stat-label">Text</span><span class="stat-val" id="statQueueText">--</span></div>
+                <div class="stat-row"><span class="stat-label">Video</span><span class="stat-val" id="statQueueVideo">--</span></div>
+                <div class="stat-row"><span class="stat-label">In-flight</span><span class="stat-val" id="statQueueInflight">--</span></div>
+                <div class="stat-row"><span class="stat-label">Dropped</span><span class="stat-val" id="statDropped">--</span></div>
+              </div>
+            </div>
+            <div class="section">
+              <h3>Device</h3>
+              <div class="stat-grid">
+                <div class="stat-row"><span class="stat-label">Transport</span><span class="stat-val" id="statTransportStatus">--</span></div>
+                <div class="stat-row"><span class="stat-label">Backend</span><span class="stat-val" id="statBackend">--</span></div>
+                <div class="stat-row"><span class="stat-label">Faces</span><span class="stat-val" id="statFaces">--</span></div>
+              </div>
             </div>
           </section>
 
+          <!-- ADVANCED TAB -->
           <section id="tabAdvanced" class="tab">
             <div class="section">
-              <h3>Codec & Display</h3>
+              <h3>Codec &amp; Display</h3>
               <div class="actions">
-                <button id="keyBtn" class="btn">Keyframe Interval</button>
-                <button id="enhanceBtn" class="btn">Enhancement</button>
-                <button id="ditherBtn" class="btn">Dithering</button>
-                <button id="recordBtn" class="btn">Recording</button>
+                <button id="keyBtn" class="btn">Keyframe: Default</button>
+                <button id="enhanceBtn" class="btn">Enhancement: Off</button>
+                <button id="ditherBtn" class="btn">Dithering: Off</button>
+                <button id="recordBtn" class="btn">Recording: Off</button>
                 <button id="forceKfBtn" class="btn">Force Keyframe</button>
                 <button id="rescanBtn" class="btn">Rescan Devices</button>
               </div>
             </div>
-
-            <div class="section" id="acousticSection">
+            <div class="section acoustic-section">
               <h3>Acoustic Link</h3>
               <div class="grid">
-                <div class="field"><label>RX Source</label><select id="rxSourceSelect"><option value="live_mic">Live Mic</option><option value="media_file">Media File</option></select></div>
-                <div class="field"><label>Session</label><select id="sessionModeSelect"><option value="broadcast">Broadcast</option><option value="duplex_arq">Duplex ARQ</option></select></div>
-                <div class="field"><label>Band</label><select id="bandModeSelect"><option value="audible">Audible</option><option value="ultrasonic">Ultrasonic</option></select></div>
+                <div class="field"><label>RX Source</label>
+                  <select id="rxSourceSelect">
+                    <option value="live_mic">Live Mic</option>
+                    <option value="media_file">Media File</option>
+                  </select>
+                </div>
+                <div class="field"><label>Session</label>
+                  <select id="sessionModeSelect">
+                    <option value="broadcast">Broadcast</option>
+                    <option value="duplex_arq">Duplex ARQ</option>
+                  </select>
+                </div>
+                <div class="field"><label>Band</label>
+                  <select id="bandModeSelect">
+                    <option value="audible">Audible</option>
+                    <option value="ultrasonic">Ultrasonic</option>
+                  </select>
+                </div>
                 <div class="field"><label>Audio Input</label><select id="audioInSelect"></select></div>
                 <div class="field"><label>Audio Output</label><select id="audioOutSelect"></select></div>
                 <div class="field full"><label>Media Path</label><input id="mediaPathInput" type="text" placeholder="/path/to/recording.mp4" /></div>
               </div>
             </div>
-
-            <div class="section" id="serialSection">
+            <div class="section serial-section">
               <h3>Serial Link</h3>
               <div class="grid">
                 <div class="field"><label>Serial Port</label><input id="serialPortInput" type="text" placeholder="/dev/cu.usbserial-*" /></div>
                 <div class="field"><label>Serial Baud</label><input id="serialBaudInput" type="number" min="1200" step="1" value="115200" /></div>
               </div>
             </div>
-
-            <div class="section">
-              <h3>Relay Paths</h3>
+            <div class="section relay-section">
+              <h3>File Relay</h3>
+              <div class="relay-info-box">
+                Use relay bundles to transfer communications via USB drive when a direct link is unavailable.
+                Export a bundle on one device, physically copy it, import on the other.
+              </div>
               <div class="grid">
-                <div class="field full"><label>Export Path</label><input id="relayExportAdvInput" type="text" placeholder="./relay_out/export.evrelay" /></div>
-                <div class="field full"><label>Import Path</label><input id="relayImportAdvInput" type="text" placeholder="./relay_in/import.evrelay" /></div>
+                <div class="field full">
+                  <label>Export Bundle File</label>
+                  <input id="relayExportAdvInput" type="text" placeholder="./relay_out/export.evrelay" />
+                </div>
+                <div class="field full">
+                  <label>Import Bundle File</label>
+                  <input id="relayImportAdvInput" type="text" placeholder="./relay_in/import.evrelay" />
+                </div>
+              </div>
+              <div class="actions">
+                <button id="exportRelayAdvBtn" class="btn">Export</button>
+                <button id="importRelayAdvBtn" class="btn">Import</button>
               </div>
             </div>
-
             <div class="actions">
               <button id="applyAdvancedBtn" class="btn primary">Apply Advanced</button>
             </div>
           </section>
+
         </div>
       </aside>
-    </section>
+    </main>
   </div>
 
   <script>
-    const stateStore = { latest: null, formDirty: false, cursor: 0 };
+    const stateStore = {
+      latest: null,
+      formDirty: false,
+      cursor: 0,
+      mainFeedUrl: '/api/v2/frame/raw.jpg',
+      secondaryFeedUrl: '/api/v2/frame/received.jpg'
+    };
 
-    const TAB_IDS = ['Link', 'Send', 'Receive', 'Status', 'Advanced'];
+    const TRANSPORT_NAMES = {
+      acoustic: 'Acoustic', serial: 'Serial', optical: 'Optical', file_relay: 'File Relay'
+    };
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    const TAB_IDS = ['Setup', 'Messages', 'Status', 'Advanced'];
     function setTab(name) {
       TAB_IDS.forEach(t => {
-        document.getElementById(`tabBtn${t}`).classList.toggle('active', t === name);
-        document.getElementById(`tab${t}`).classList.toggle('active', t === name);
+        document.getElementById('tabBtn' + t).classList.toggle('active', t === name);
+        document.getElementById('tab' + t).classList.toggle('active', t === name);
       });
     }
 
-    function num(v, d = 0) {
+    function num(v, d) {
       const n = Number(v);
-      return Number.isFinite(n) ? n : d;
+      return Number.isFinite(n) ? n : (d !== undefined ? d : 0);
     }
 
-    function text(v, d = '') {
-      return (typeof v === 'string' && v.length > 0) ? v : d;
+    function text(v, d) {
+      return (typeof v === 'string' && v.length > 0) ? v : (d || '');
+    }
+
+    function setRole(role) {
+      document.getElementById('roleSelect').value = role;
+      stateStore.formDirty = true;
+      applyRoleToUI(role);
+    }
+
+    function applyRoleToUI(role) {
+      document.querySelector('.shell').setAttribute('data-role', role || 'duplex');
+      ['Send', 'Receive', 'Duplex'].forEach(function(r) {
+        document.getElementById('roleBtn' + r).classList.toggle('active', r.toLowerCase() === role);
+      });
+      if (role === 'receive') {
+        stateStore.mainFeedUrl = '/api/v2/frame/received.jpg';
+        stateStore.secondaryFeedUrl = null;
+        document.getElementById('feedMainLabel').textContent = 'Received Stream';
+      } else if (role === 'send') {
+        stateStore.mainFeedUrl = '/api/v2/frame/raw.jpg';
+        stateStore.secondaryFeedUrl = '/api/v2/frame/sent.jpg';
+        document.getElementById('feedMainLabel').textContent = 'Raw Input';
+        document.getElementById('feedSecondaryLabel').textContent = 'Sent Stream';
+      } else {
+        stateStore.mainFeedUrl = '/api/v2/frame/raw.jpg';
+        stateStore.secondaryFeedUrl = '/api/v2/frame/received.jpg';
+        document.getElementById('feedMainLabel').textContent = 'Raw Input';
+        document.getElementById('feedSecondaryLabel').textContent = 'Received Stream';
+      }
+    }
+
+    function syncTransportVisibility(transport) {
+      document.querySelector('.shell').setAttribute('data-transport', transport || 'acoustic');
+      document.getElementById('topbarTransport').textContent = TRANSPORT_NAMES[transport] || transport || '--';
+    }
+
+    function updateFeedOverlay(data) {
+      var overlay = document.getElementById('feedOverlay');
+      var running = !!(data.link_running);
+      var locked = !!(data.link_stats && data.link_stats.sync_locked);
+      var role = data.link_role || 'duplex';
+      if (role === 'receive' && running && !locked) {
+        overlay.classList.remove('hidden');
+      } else {
+        overlay.classList.add('hidden');
+      }
     }
 
     async function postJson(url, body) {
@@ -1415,44 +1693,98 @@ std::string makeIndexHtml() {
 
     async function refreshState() {
       try {
-        const resp = await fetch('/api/v2/state', { cache: 'no-store' });
+        var resp = await fetch('/api/v2/state', { cache: 'no-store' });
         if (!resp.ok) return;
-        const data = await resp.json();
+        var data = await resp.json();
         stateStore.latest = data;
         renderState(data);
       } catch (_) {}
     }
 
+    function renderTopbar(data) {
+      var dot = document.getElementById('connDot');
+      var label = document.getElementById('connLabel');
+      var bwLabel = document.getElementById('topbarBw');
+      var running = !!(data.link_running);
+      var locked = !!(data.link_stats && data.link_stats.sync_locked);
+      dot.className = 'conn-dot';
+      if (!running) {
+        label.textContent = 'Stopped';
+        bwLabel.textContent = '';
+      } else if (locked) {
+        dot.classList.add('linked');
+        label.textContent = 'Linked';
+        bwLabel.textContent = num(data.link_stats && data.link_stats.effective_payload_kbps).toFixed(1) + ' kbps';
+      } else {
+        dot.classList.add('searching');
+        label.textContent = 'Searching...';
+        bwLabel.textContent = '';
+      }
+    }
+
+    function renderStatusTab(data) {
+      var running = !!(data.link_running);
+      var locked = !!(data.link_stats && data.link_stats.sync_locked);
+      function sv(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
+      sv('statSignal', locked ? 'Good' : (running ? 'Searching...' : 'Not running'));
+      sv('statBw', num(data.link_stats && data.link_stats.effective_payload_kbps).toFixed(1) + ' kbps');
+      sv('statRtt', num(data.link_stats && data.link_stats.rtt_ms).toFixed(0) + ' ms');
+      sv('statBer', num(data.link_stats && data.link_stats.ber).toFixed(5));
+      sv('statFps', num(data.metrics && data.metrics.fps).toFixed(1));
+      sv('statQueueText', num(data.queue && data.queue.text).toFixed(0));
+      sv('statQueueVideo', num(data.queue && data.queue.video).toFixed(0));
+      sv('statQueueInflight', num(data.queue && data.queue.inflight).toFixed(0));
+      sv('statDropped', num(data.queue && data.queue.dropped).toFixed(0));
+      sv('statTransportStatus', (TRANSPORT_NAMES[data.transport_kind] || data.transport_kind || '--') + ' \u2014 ' + (data.transport_status || '--'));
+      sv('statBackend', data.status || '--');
+      sv('statFaces', 'now ' + num(data.faces_now).toFixed(0) + ' / gathered ' + num(data.faces_gathered).toFixed(0));
+    }
+
     function renderMessages(messages) {
-      const chat = document.getElementById('chatLog');
-      const msgArr = Array.isArray(messages) ? messages : [];
+      var chat = document.getElementById('chatLog');
+      var msgArr = Array.isArray(messages) ? messages : [];
       chat.innerHTML = '';
-      for (const m of msgArr) {
-        const div = document.createElement('div');
-        div.className = 'msg';
-        const scope = m.scope || 'broadcast';
-        const state = Number(m.state || 0);
-        const stateLabel = ['queued', 'sent', 'acked', 'relayed', 'failed'][state] || 'unknown';
-        div.innerHTML = `<div class="meta">#${m.msg_id} from ${m.sender} to ${scope}${scope === 'direct' ? ':' + m.target : ''} <span class="badge">${stateLabel}</span></div><div>${m.body || ''}</div>`;
+      var stateLabels = ['Queued', 'Sent', 'Acked', 'Relayed', 'Failed'];
+      for (var i = 0; i < msgArr.length; i++) {
+        var m = msgArr[i];
+        var state = Number(m.state || 0);
+        var isIncoming = state === 3;
+        var div = document.createElement('div');
+        div.className = isIncoming ? 'msg-in' : 'msg-out';
+        var tsMs = Number(m.timestamp_ms);
+        var timeStr = (Number.isFinite(tsMs) && tsMs > 0)
+          ? new Date(tsMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : '';
+        var senderStr = isIncoming
+          ? (' from ' + ('0000' + Number(m.sender).toString(16)).slice(-4).toUpperCase())
+          : '';
+        var stateLabel = stateLabels[state] || 'Unknown';
+        div.innerHTML =
+          '<div class="msg-meta">' +
+          escapeHtml(timeStr + senderStr) +
+          ' <span class="msg-state s' + state + '">' + escapeHtml(stateLabel) + '</span>' +
+          '</div>' +
+          '<div>' + escapeHtml(m.body || '') + '</div>';
         chat.appendChild(div);
       }
       chat.scrollTop = chat.scrollHeight;
     }
 
     function syncSelectOptions(selectEl, entries, current, labelFn) {
-      const list = Array.isArray(entries) ? entries : [];
-      const seen = new Set(Array.from(selectEl.options).map(o => String(o.value)));
-      for (const entry of list) {
-        const value = String(typeof entry === 'object' ? entry.index : entry);
+      var list = Array.isArray(entries) ? entries : [];
+      var seen = new Set(Array.from(selectEl.options).map(function(o) { return String(o.value); }));
+      for (var i = 0; i < list.length; i++) {
+        var entry = list[i];
+        var value = String(typeof entry === 'object' ? entry.index : entry);
         if (!seen.has(value)) {
-          const opt = document.createElement('option');
+          var opt = document.createElement('option');
           opt.value = value;
           opt.textContent = labelFn(entry);
           selectEl.appendChild(opt);
         }
       }
-      Array.from(selectEl.options).forEach(o => {
-        if (!list.some(e => String(typeof e === 'object' ? e.index : e) === o.value)) {
+      Array.from(selectEl.options).forEach(function(o) {
+        if (!list.some(function(e) { return String(typeof e === 'object' ? e.index : e) === o.value; })) {
           selectEl.removeChild(o);
         }
       });
@@ -1461,25 +1793,13 @@ std::string makeIndexHtml() {
       }
     }
 
-    function syncContextVisibility(data) {
-      const transport = text(data.transport_kind, 'acoustic');
-      document.getElementById('acousticSection').classList.toggle('hidden', transport !== 'acoustic');
-      document.getElementById('serialSection').classList.toggle('hidden', transport !== 'serial');
-    }
-
     function renderState(data) {
-      document.getElementById('statusText').textContent =
-        `node ${data.node_alias || '-'} | mode ${data.mode} ${data.resolution} | ${data.status}`;
-
-      const live = num(data.metrics?.live_kbps);
-      const smooth = num(data.metrics?.smooth_kbps);
-      const avg = num(data.metrics?.avg_kbps);
-      document.getElementById('bwBar').value = Math.max(0, Math.min(220, smooth));
-      document.getElementById('bwText').textContent = `live ${live.toFixed(2)} kbps | smooth ${smooth.toFixed(2)} kbps | avg ${avg.toFixed(2)} kbps`;
-
-      syncSelectOptions(document.getElementById('cameraSelect'), data.cameras || [], data.camera, id => `Camera ${id}`);
-      syncSelectOptions(document.getElementById('audioInSelect'), data.audio_inputs || [], data.audio_in_device, d => d.default ? `${d.name} (Default)` : d.name);
-      syncSelectOptions(document.getElementById('audioOutSelect'), data.audio_outputs || [], data.audio_out_device, d => d.default ? `${d.name} (Default)` : d.name);
+      syncSelectOptions(document.getElementById('cameraSelect'), data.cameras || [], data.camera,
+        function(id) { return 'Camera ' + id; });
+      syncSelectOptions(document.getElementById('audioInSelect'), data.audio_inputs || [], data.audio_in_device,
+        function(d) { return d.default ? d.name + ' (Default)' : d.name; });
+      syncSelectOptions(document.getElementById('audioOutSelect'), data.audio_outputs || [], data.audio_out_device,
+        function(d) { return d.default ? d.name + ' (Default)' : d.name; });
 
       if (!stateStore.formDirty) {
         document.getElementById('aliasInput').value = data.node_alias || '';
@@ -1498,49 +1818,38 @@ std::string makeIndexHtml() {
         document.getElementById('relayImportInput').value = data.relay_import_path || '';
         document.getElementById('relayExportAdvInput').value = data.relay_export_path || '';
         document.getElementById('relayImportAdvInput').value = data.relay_import_path || '';
+        applyRoleToUI(data.link_role || 'duplex');
       }
 
-      document.getElementById('startBtn').disabled = !!data.link_running;
-      document.getElementById('stopBtn').disabled = !data.link_running;
-      document.getElementById('keyBtn').textContent = `Keyframe: ${data.short_keyframe ? 'Short' : 'Default'}`;
-      document.getElementById('enhanceBtn').textContent = `Enhancement: ${data.enhance ? 'On' : 'Off'}`;
-      document.getElementById('ditherBtn').textContent = `Dithering: ${data.dither ? 'On' : 'Off'}`;
-      document.getElementById('recordBtn').textContent = `Recording: ${data.recording ? 'On' : 'Off'}`;
+      syncTransportVisibility(document.getElementById('transportSelect').value);
 
-      document.getElementById('chipTransport').textContent =
-        `transport ${data.transport_kind} | ${data.transport_status || '-'}`;
-      document.getElementById('chipRole').textContent =
-        `role ${data.link_role || '-'} | link ${data.link_running ? 'running' : 'stopped'}`;
-      document.getElementById('chipSync').textContent =
-        `sync ${data.link_stats?.sync_locked ? 'locked' : 'searching'} | payload ${num(data.link_stats?.effective_payload_kbps).toFixed(2)} kbps`;
-      document.getElementById('chipQueue').textContent =
-        `Q text ${num(data.queue?.text).toFixed(0)} | video ${num(data.queue?.video).toFixed(0)} | dropped ${num(data.queue?.dropped).toFixed(0)}`;
+      var lBtn = document.getElementById('linkToggleBtn');
+      if (data.link_running) {
+        lBtn.textContent = 'Stop Link';
+        lBtn.className = 'link-btn stop';
+      } else {
+        lBtn.textContent = 'Start Link';
+        lBtn.className = 'link-btn start';
+      }
 
-      document.getElementById('statTransport').textContent =
-        `transport ${data.transport_kind} | status ${data.transport_status || '-'} | role ${data.link_role || '-'}`;
-      document.getElementById('statFallback').textContent =
-        `fallback stage ${num(data.fallback_stage).toFixed(0)} | queue dropped ${num(data.queue?.dropped).toFixed(0)}`;
-      document.getElementById('statQueue').textContent =
-        `Q config ${num(data.queue?.config).toFixed(0)} ack ${num(data.queue?.ack).toFixed(0)} text ${num(data.queue?.text).toFixed(0)} snap ${num(data.queue?.snapshot).toFixed(0)} video ${num(data.queue?.video).toFixed(0)} inflight ${num(data.queue?.inflight).toFixed(0)}`;
-      document.getElementById('statCodec').textContent =
-        `fps ${num(data.metrics?.fps).toFixed(2)} key-int ${num(data.keyframe_interval).toFixed(0)} changed ${num(data.metrics?.changed_percent).toFixed(1)}%`;
-      document.getElementById('statLink').textContent =
-        `sync ${data.link_stats?.sync_locked ? 'locked' : 'searching'} ber ${num(data.link_stats?.ber).toFixed(5)} rtx ${num(data.link_stats?.retransmit_count).toFixed(0)} payload ${num(data.link_stats?.effective_payload_kbps).toFixed(2)} kbps`;
-      document.getElementById('statQuality').textContent =
-        `ratio4 ${num(data.metrics?.ratio_raw4).toFixed(2)}x ratio8 ${num(data.metrics?.ratio_raw8).toFixed(2)}x PSNR ${num(data.metrics?.psnr).toFixed(2)} dB`;
-      document.getElementById('statFaces').textContent =
-        `faces now ${num(data.faces_now).toFixed(0)} gathered ${num(data.faces_gathered).toFixed(0)} detector ${data.face_detector ? 'on' : 'off'}`;
+      document.getElementById('keyBtn').textContent = 'Keyframe: ' + (data.short_keyframe ? 'Short' : 'Default');
+      document.getElementById('enhanceBtn').textContent = 'Enhancement: ' + (data.enhance ? 'On' : 'Off');
+      document.getElementById('ditherBtn').textContent = 'Dithering: ' + (data.dither ? 'On' : 'Off');
+      document.getElementById('recordBtn').textContent = 'Recording: ' + (data.recording ? 'On' : 'Off');
 
+      renderTopbar(data);
+      renderStatusTab(data);
       renderMessages(data.messages || []);
+      updateFeedOverlay(data);
       stateStore.cursor = Math.max(stateStore.cursor, num(data.latest_text_cursor));
-      syncContextVisibility(data);
     }
 
     function refreshFrames() {
-      const ts = Date.now();
-      document.getElementById('feedRaw').src = `/api/v2/frame/raw.jpg?t=${ts}`;
-      document.getElementById('feedSent').src = `/api/v2/frame/sent.jpg?t=${ts}`;
-      document.getElementById('feedReceived').src = `/api/v2/frame/received.jpg?t=${ts}`;
+      var ts = Date.now();
+      document.getElementById('feedMain').src = stateStore.mainFeedUrl + '?t=' + ts;
+      if (stateStore.secondaryFeedUrl) {
+        document.getElementById('feedSecondary').src = stateStore.secondaryFeedUrl + '?t=' + ts;
+      }
     }
 
     function collectControl() {
@@ -1560,65 +1869,91 @@ std::string makeIndexHtml() {
         serial_port: document.getElementById('serialPortInput').value,
         serial_baud: document.getElementById('serialBaudInput').value,
         node_alias: document.getElementById('aliasInput').value,
-        relay_export_path: document.getElementById('relayExportAdvInput').value || document.getElementById('relayExportInput').value,
-        relay_import_path: document.getElementById('relayImportAdvInput').value || document.getElementById('relayImportInput').value
+        relay_export_path: document.getElementById('relayExportInput').value || document.getElementById('relayExportAdvInput').value,
+        relay_import_path: document.getElementById('relayImportInput').value || document.getElementById('relayImportAdvInput').value
       };
     }
 
     async function applyControl(extra) {
-      const body = Object.assign(collectControl(), extra || {});
+      var body = Object.assign(collectControl(), extra || {});
       await postJson('/api/v2/control', body);
       stateStore.formDirty = false;
       await refreshState();
     }
 
     function bind() {
-      document.getElementById('tabBtnLink').onclick = () => setTab('Link');
-      document.getElementById('tabBtnSend').onclick = () => setTab('Send');
-      document.getElementById('tabBtnReceive').onclick = () => setTab('Receive');
-      document.getElementById('tabBtnStatus').onclick = () => setTab('Status');
-      document.getElementById('tabBtnAdvanced').onclick = () => setTab('Advanced');
+      document.getElementById('tabBtnSetup').onclick = function() { setTab('Setup'); };
+      document.getElementById('tabBtnMessages').onclick = function() { setTab('Messages'); };
+      document.getElementById('tabBtnStatus').onclick = function() { setTab('Status'); };
+      document.getElementById('tabBtnAdvanced').onclick = function() { setTab('Advanced'); };
 
-      ['aliasInput','cameraSelect','modeSelect','resSelect','fpsInput','transportSelect','roleSelect','rxSourceSelect',
-       'sessionModeSelect','bandModeSelect','audioInSelect','audioOutSelect','mediaPathInput','serialPortInput','serialBaudInput',
-       'relayExportInput','relayImportInput','relayExportAdvInput','relayImportAdvInput']
-        .forEach(id => document.getElementById(id).addEventListener('input', () => { stateStore.formDirty = true; }));
+      document.getElementById('roleBtnSend').onclick = function() { setRole('send'); };
+      document.getElementById('roleBtnReceive').onclick = function() { setRole('receive'); };
+      document.getElementById('roleBtnDuplex').onclick = function() { setRole('duplex'); };
 
-      document.getElementById('applyBtn').onclick = async () => applyControl({});
-      document.getElementById('applyAdvancedBtn').onclick = async () => applyControl({});
-      document.getElementById('startBtn').onclick = async () => postJson('/api/v2/link/start', {});
-      document.getElementById('stopBtn').onclick = async () => postJson('/api/v2/link/stop', {});
-      document.getElementById('forceKfBtn').onclick = async () => applyControl({ force_keyframe: true });
-      document.getElementById('rescanBtn').onclick = async () => applyControl({ rescan_cameras: true, rescan_audio: true });
-      document.getElementById('keyBtn').onclick = async () => applyControl({ short_keyframe: !(stateStore.latest?.short_keyframe) });
-      document.getElementById('enhanceBtn').onclick = async () => applyControl({ enhance: !(stateStore.latest?.enhance) });
-      document.getElementById('ditherBtn').onclick = async () => applyControl({ dither: !(stateStore.latest?.dither) });
-      document.getElementById('recordBtn').onclick = async () => applyControl({ recording: !(stateStore.latest?.recording) });
-      document.getElementById('exportRelayBtn').onclick = async () => applyControl({ export_relay: true });
-      document.getElementById('importRelayBtn').onclick = async () => applyControl({ import_relay: true });
+      document.getElementById('transportSelect').addEventListener('change', function() {
+        stateStore.formDirty = true;
+        syncTransportVisibility(this.value);
+      });
 
-      async function sendText(text) {
+      document.getElementById('textScopeSelect').addEventListener('change', function() {
+        document.getElementById('textTargetField').style.display = this.value === 'direct' ? 'grid' : 'none';
+      });
+
+      ['aliasInput','cameraSelect','modeSelect','resSelect','fpsInput','roleSelect','rxSourceSelect',
+       'sessionModeSelect','bandModeSelect','audioInSelect','audioOutSelect','mediaPathInput',
+       'serialPortInput','serialBaudInput','relayExportInput','relayImportInput',
+       'relayExportAdvInput','relayImportAdvInput']
+        .forEach(function(id) {
+          document.getElementById(id).addEventListener('input', function() { stateStore.formDirty = true; });
+        });
+
+      document.getElementById('linkToggleBtn').onclick = async function() {
+        var data = stateStore.latest;
+        if (data && data.link_running) {
+          await postJson('/api/v2/link/stop', {});
+        } else {
+          await applyControl({});
+          await postJson('/api/v2/link/start', {});
+        }
+        await refreshState();
+      };
+
+      document.getElementById('applyAdvancedBtn').onclick = async function() { await applyControl({}); };
+      document.getElementById('forceKfBtn').onclick = async function() { await applyControl({ force_keyframe: true }); };
+      document.getElementById('rescanBtn').onclick = async function() { await applyControl({ rescan_cameras: true, rescan_audio: true }); };
+      document.getElementById('keyBtn').onclick = async function() { await applyControl({ short_keyframe: !(stateStore.latest && stateStore.latest.short_keyframe) }); };
+      document.getElementById('enhanceBtn').onclick = async function() { await applyControl({ enhance: !(stateStore.latest && stateStore.latest.enhance) }); };
+      document.getElementById('ditherBtn').onclick = async function() { await applyControl({ dither: !(stateStore.latest && stateStore.latest.dither) }); };
+      document.getElementById('recordBtn').onclick = async function() { await applyControl({ recording: !(stateStore.latest && stateStore.latest.recording) }); };
+      document.getElementById('exportRelayBtn').onclick = async function() { await applyControl({ export_relay: true }); };
+      document.getElementById('importRelayBtn').onclick = async function() { await applyControl({ import_relay: true }); };
+      document.getElementById('exportRelayAdvBtn').onclick = async function() { await applyControl({ export_relay: true }); };
+      document.getElementById('importRelayAdvBtn').onclick = async function() { await applyControl({ import_relay: true }); };
+
+      async function sendText(txt) {
         await postJson('/api/v2/messages/send', {
-          body: text,
+          body: txt,
           scope: document.getElementById('textScopeSelect').value,
           target_node_id: Number(document.getElementById('textTargetInput').value || 0)
         });
       }
 
-      document.getElementById('sendTextBtn').onclick = async () => {
-        const box = document.getElementById('textBodyInput');
-        const text = (box.value || '').trim();
-        if (!text) return;
-        await sendText(text);
+      document.getElementById('sendTextBtn').onclick = async function() {
+        var box = document.getElementById('textBodyInput');
+        var txt = (box.value || '').trim();
+        if (!txt) return;
+        await sendText(txt);
         box.value = '';
       };
-      document.getElementById('quickNeedBtn').onclick = async () => sendText('Need medical help at current location.');
-      document.getElementById('quickSafeBtn').onclick = async () => sendText('We are safe and holding position.');
-      document.getElementById('quickMoveBtn').onclick = async () => sendText('Moving north to extraction point.');
+      document.getElementById('quickNeedBtn').onclick = async function() { await sendText('Need medical help at current location.'); };
+      document.getElementById('quickSafeBtn').onclick = async function() { await sendText('We are safe and holding position.'); };
+      document.getElementById('quickMoveBtn').onclick = async function() { await sendText('Moving north to extraction point.'); };
     }
 
     bind();
-    setTab('Link');
+    setTab('Setup');
+    applyRoleToUI('duplex');
     refreshState();
     refreshFrames();
     setInterval(refreshState, 500);

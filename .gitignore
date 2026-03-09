@@ -61,3 +61,4 @@ Testing/
 
 # Generated runtime artifacts
 *.evs
+relay_store/blobs/
