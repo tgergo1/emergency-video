@@ -264,7 +264,7 @@ Change map uses run-length coding over block states (`unchanged`/`changed`), sta
 ## How to Tune for Better Recognizability
 
 - Use `safer` mode.
-- Reduce keyframe interval (use `default` instead of `short`).
+- Reduce keyframe interval (use `short` instead of `default`).
 - Lower skip thresholds to update more blocks.
 - Increase `maxChangedFraction`.
 - Lower `residualStep`.
