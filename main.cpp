@@ -596,7 +596,7 @@ void printControls() {
               << "  f       : force next frame to keyframe\n"
               << "  mouse   : click FPS/RES buttons in dashboard view\n"
               << "Camera:\n"
-              << "  EV_CAMERA_INDEX=<n> to choose preferred camera index (default 0 for internal webcam)\n";
+              << "  EV_CAMERA_INDEX=<n> to choose preferred camera index (default 1)\n";
 }
 } // namespace
 
